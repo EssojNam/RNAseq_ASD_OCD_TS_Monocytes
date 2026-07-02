@@ -1,0 +1,569 @@
+---
+title: "04_GSEA_CrossModule_Comparison"
+output: html_document
+date: "2026-03-25"
+---
+
+## 0. Libraries and paths
+
+```{r setup}
+
+library(dplyr)
+library(tibble)
+library(tidyr)
+library(ggplot2)
+library(pheatmap)
+library(RColorBrewer)
+library(purrr)
+
+# ── Paths ────────────────────────────────────────────────────────────────────
+database_dir <- "/home/jose/Desktop/RNAseq/results/Enrichment/GSEA_inputs/Reports/REACTOME/"
+out_dir   <- "/home/jose/Desktop/RNAseq/results/Enrichment/GSEA_inputs/Reports/CrossModules/REACTOME/M3"
+plot_dir  <- "/home/jose/Desktop/RNAseq/results/plots/Enrichment/KEGG"
+
+dir.create(out_dir,  recursive = TRUE, showWarnings = FALSE)
+dir.create(plot_dir, recursive = TRUE, showWarnings = FALSE)
+
+# ── Significance thresholds ──────────────────────────────────────────────────
+FDR_SIG        <- 0.05   # Significant
+FDR_BORDERLINE <- 0.25   # Borderline — consistent signal worth noting
+# > 0.40 = ns
+
+```
+
+---
+
+## 1. Modular loading functions
+
+```{r load_functions}
+
+# Null-coalescing operator
+`%||%` <- function(a, b) if (!is.null(a)) a else b
+
+# ── Read one GSEA TSV file ────────────────────────────────────────────────────
+read_gsea_tsv <- function(path) {
+  if (is.null(path) || !file.exists(path)) return(NULL)
+
+  df <- tryCatch(
+    read.delim(path, stringsAsFactors = FALSE, check.names = FALSE),
+    error = function(e) { message("Read error: ", path); return(NULL) }
+  )
+  if (is.null(df)) return(NULL)
+
+  colnames(df) <- toupper(trimws(colnames(df)))
+
+  # Normalise FDR column name across GSEA versions
+  if (!"FDR Q-VAL" %in% colnames(df) && "FDR.Q.VAL" %in% colnames(df))
+    colnames(df)[colnames(df) == "FDR.Q.VAL"] <- "FDR Q-VAL"
+
+  needed <- c("NAME", "NES", "FDR Q-VAL")
+  if (!all(needed %in% colnames(df))) {
+    warning("Missing columns in ", basename(path), ": ",
+            paste(setdiff(needed, colnames(df)), collapse = ", "))
+    return(NULL)
+  }
+
+  df %>%
+    select(NAME, NES, `FDR Q-VAL`) %>%
+    rename(pathway = NAME, NES = NES, FDR = `FDR Q-VAL`) %>%
+    filter(!is.na(NES))
+}
+
+# ── Load pos + neg TSVs for one GSEA run ─────────────────────────────────────
+# Files follow pattern: <label>_gsea_report_for_na_pos_<timestamp>.tsv
+load_gsea_result <- function(root, label) {
+
+  all_files <- list.files(root, pattern = "\\.tsv$",
+                          full.names = TRUE, ignore.case = TRUE)
+  label_esc <- gsub("\\.", "\\\\.", label)
+
+  pick_latest <- function(files) {
+    if (length(files) == 0) return(NULL)
+    files[which.max(file.mtime(files))]
+  }
+
+  pos_file <- pick_latest(
+    all_files[grepl(paste0("^", label_esc, "_gsea_report_for_na_pos"),
+                    basename(all_files))]
+  )
+  neg_file <- pick_latest(
+    all_files[grepl(paste0("^", label_esc, "_gsea_report_for_na_neg"),
+                    basename(all_files))]
+  )
+
+  pos <- read_gsea_tsv(pos_file)
+  neg <- read_gsea_tsv(neg_file)
+
+  result <- bind_rows(pos, neg)
+  if (nrow(result) == 0) {
+    message("No results for: ", label); return(NULL)
+  }
+
+  message("Loaded: ", label,
+          "  pos=", nrow(pos %||% data.frame()),
+          " / neg=", nrow(neg %||% data.frame()))
+  result
+}
+
+# ── Annotate significance tier for one result dataframe ──────────────────────
+# Adds: sig_tier (sig / borderline / ns), direction (up / down / ns)
+annotate_significance <- function(gsea_df) {
+  if (is.null(gsea_df)) return(NULL)
+  gsea_df %>%
+    mutate(
+      sig_tier = case_when(
+        FDR <= FDR_SIG        ~ "sig",
+        FDR <= FDR_BORDERLINE ~ "borderline",
+        TRUE                  ~ "ns"
+      ),
+      direction = case_when(
+        FDR <= FDR_SIG & NES > 0 ~ "up",
+        FDR <= FDR_SIG & NES < 0 ~ "down",
+        TRUE                     ~ "ns"
+      )
+    )
+}
+
+```
+
+---
+
+## 2. Load all GSEA results
+
+```{r load_all}
+
+labels <- list(
+  M3_TEA_vs_TOC        = "M3_TEA_vs_TOC_REACTOME",
+  M3_TEA_vs_Tourette        = "M3_TEA_vs_Tourette_REACTOME",
+  M3_TOC_vs_Tourette   = "M3_TOC_vs_Tourette_REACTOME"
+)
+
+# Load and annotate all results
+gsea_results <- lapply(labels, function(lbl) {
+  res <- load_gsea_result(database_dir, lbl)
+  annotate_significance(res)
+})
+names(gsea_results) <- names(labels)
+
+loaded <- !sapply(gsea_results, is.null)
+message("\nLoaded: ", sum(loaded), "/", length(loaded))
+if (any(!loaded))
+  message("Missing: ", paste(names(loaded)[!loaded], collapse = ", "))
+
+# Universe of all pathways tested across all runs
+all_pathways <- unique(unlist(lapply(gsea_results, function(x) x$pathway)))
+message("Total unique pathways: ", length(all_pathways))
+
+```
+
+---
+
+## 3. Build master table — full information retention
+
+```{r master_table}
+
+# ── For each module, create a per-pathway dataframe with NES, FDR, sig_tier ──
+# Pathways not tested in a given module get NA (not "ns") for NES and FDR
+# and "not_tested" for sig_tier and direction
+build_module_columns <- function(gsea_df, mod_name, all_pathways) {
+
+  base <- data.frame(pathway = all_pathways, stringsAsFactors = FALSE)
+
+  if (is.null(gsea_df)) {
+    base[[paste0(mod_name, "_NES")]]      <- NA_real_
+    base[[paste0(mod_name, "_FDR")]]      <- NA_real_
+    base[[paste0(mod_name, "_sig")]]      <- "not_tested"
+    base[[paste0(mod_name, "_direction")]] <- "not_tested"
+    return(base)
+  }
+
+  merged <- base %>%
+    left_join(
+      gsea_df %>% select(pathway, NES, FDR, sig_tier, direction),
+      by = "pathway"
+    ) %>%
+    rename(
+      !!paste0(mod_name, "_NES")       := NES,
+      !!paste0(mod_name, "_FDR")       := FDR,
+      !!paste0(mod_name, "_sig")       := sig_tier,
+      !!paste0(mod_name, "_direction") := direction
+    ) %>%
+    mutate(
+      # Pathways tested but not significant are "ns", not "not_tested"
+      !!paste0(mod_name, "_sig") :=
+        ifelse(is.na(.data[[paste0(mod_name, "_sig")]]),
+               "not_tested",
+               .data[[paste0(mod_name, "_sig")]]),
+      !!paste0(mod_name, "_direction") :=
+        ifelse(is.na(.data[[paste0(mod_name, "_direction")]]),
+               "not_tested",
+               .data[[paste0(mod_name, "_direction")]])
+    )
+  merged
+}
+
+# Build and merge all modules
+module_dfs <- lapply(names(gsea_results), function(mod) {
+  build_module_columns(gsea_results[[mod]], mod, all_pathways)
+})
+
+master <- reduce(module_dfs, left_join, by = "pathway")
+
+message("Master table built: ", nrow(master), " pathways x ",
+        ncol(master), " columns")
+
+```
+
+---
+
+## 4. Consistency metrics between M2 diagnoses
+
+```{r consistency_metrics}
+
+nes_m3_cols <- c("M3_TEA_vs_TOC_NES", "M3_TEA_vs_Tourette_NES", "M3_TOC_vs_Tourette_NES")
+dir_m3_cols <- c("M3_TEA_vs_TOC_direction", "M3_TEA_vs_Tourette_direction", "M3_TOC_vs_Tourette_direction")
+sig_m3_cols <- c("M3_TEA_vs_TOC_sig", "M3_TEA_vs_Tourette_sig", "M3_TOC_vs_Tourette_sig")
+
+master <- master %>%
+  mutate(
+
+    # ── How many M2 diagnoses are significant? ────────────────────────────────
+    M3_n_sig = rowSums(across(all_of(sig_m3_cols), ~ . == "sig")),
+    M3_n_borderline = rowSums(across(all_of(sig_m3_cols), ~ . == "borderline")),
+    M3_n_tested = rowSums(across(all_of(sig_m3_cols), ~ . != "not_tested")),
+
+    # ── Direction concordance ─────────────────────────────────────────────────
+    # Among tested diagnoses, are directions consistent?
+    M2_directions_tested = pmap_chr(
+      list(M2_TEA_direction, M2_TOC_direction, M2_Tourette_direction),
+      function(a, b, c) {
+        dirs <- unique(c(a, b, c)[c(a, b, c) != "not_tested"])
+        if (length(dirs) == 0) return("not_tested")
+        if (length(dirs) == 1) return(dirs)
+        return("mixed")
+      }
+    ),
+
+    # ── Rich M2 category ─────────────────────────────────────────────────────
+    M2_category = case_when(
+
+      # All 3 significant, same direction
+      M2_n_sig == 3 & M2_directions_tested == "up"   ~ "Shared_all_up",
+      M2_n_sig == 3 & M2_directions_tested == "down" ~ "Shared_all_down",
+      M2_n_sig == 3 & M2_directions_tested == "mixed" ~ "Shared_all_divergent",
+
+      # 2 of 3 significant, consistent direction
+      M2_n_sig == 2 &
+        M2_TEA_sig == "sig" & M2_TOC_sig == "sig" &
+        M2_TEA_direction == M2_TOC_direction         ~ "Shared_TEA_TOC",
+      M2_n_sig == 2 &
+        M2_TEA_sig == "sig" & M2_Tourette_sig == "sig" &
+        M2_TEA_direction == M2_Tourette_direction    ~ "Shared_TEA_Tourette",
+      M2_n_sig == 2 &
+        M2_TOC_sig == "sig" & M2_Tourette_sig == "sig" &
+        M2_TOC_direction == M2_Tourette_direction    ~ "Shared_TOC_Tourette",
+
+      # 2 of 3 significant but divergent directions
+      M2_n_sig == 2                                  ~ "Shared_2_divergent",
+
+      # Exactly 1 significant
+      M2_n_sig == 1 & M2_TEA_sig == "sig"            ~ "Specific_TEA",
+      M2_n_sig == 1 & M2_TOC_sig == "sig"            ~ "Specific_TOC",
+      M2_n_sig == 1 & M2_Tourette_sig == "sig"       ~ "Specific_Tourette",
+
+      # None significant but borderline in >=2
+      M2_n_sig == 0 & M2_n_borderline >= 2 &
+        M2_directions_tested != "mixed"              ~ "Borderline_consistent",
+
+      # None significant, borderline in 1
+      M2_n_sig == 0 & M2_n_borderline == 1           ~ "Borderline_1",
+
+      # Nothing
+      TRUE                                           ~ "Not_enriched"
+    ))
+
+message("M2 category distribution:")
+print(table(master$M2_category))
+
+```
+
+---
+
+## 5. Generate output tables
+
+```{r output_tables}
+
+# ── Save master table ─────────────────────────────────────────────────────────
+
+tableM <- master %>%
+  select(pathway, M2_category, 
+         M2_TEA_NES, M2_TOC_NES, M2_Tourette_NES, 
+         M2_TEA_FDR, M2_TOC_FDR, M2_Tourette_FDR,
+         M2_TEA_sig, M2_TOC_sig, M2_Tourette_sig,
+         M2_TEA_direction, M2_TOC_direction, M2_Tourette_direction, 
+         M2_directions_tested)
+
+write.csv(tableM, file = file.path(out_dir, "Table_KEGG_comparison.csv"),
+          row.names = FALSE)
+message("Table KEGG saved: ", nrow(master), " pathways")
+
+```
+
+---
+
+## 6. Visualizations
+
+### 6a. NES heatmap with significance overlay
+
+```{r heatmap_nes_sig}
+
+# ── M2 NES heatmap with significance asterisks ───────────────────────────────
+nes_cols <- c("M2_TEA_NES", "M2_TOC_NES", "M2_Tourette_NES")
+sig_cols <- c("M2_TEA_sig", "M2_TOC_sig", "M2_Tourette_sig")
+
+# Include all pathways tested in at least one M2 diagnosis
+nes_m2 <- master %>%
+  filter(M2_n_tested >= 1) %>%
+  select(pathway, M2_category, all_of(nes_cols)) %>%
+  column_to_rownames("pathway")
+
+# Build significance label matrix for display
+sig_m2_mat <- master %>%
+  filter(M2_n_tested >= 1) %>%
+  select(pathway, all_of(sig_cols)) %>%
+  column_to_rownames("pathway") %>%
+  mutate(across(everything(), ~ case_when(
+    . == "sig"        ~ "*",
+    . == "borderline" ~ "·",
+    TRUE              ~ ""
+  )))
+
+ann_row <- master %>%
+  filter(M2_n_tested >= 1) %>%
+  select(pathway, M2_category) %>%
+  column_to_rownames("pathway")
+
+nes_mat <- nes_m2 %>% select(all_of(nes_cols))
+colnames(nes_mat) <- c("TEA", "TOC", "Tourette")
+nes_mat[is.na(nes_mat)] <- 0
+colnames(sig_m2_mat) <- c("TEA", "TOC", "Tourette")
+
+# Sort by mean NES
+nes_mat <- nes_mat[order(rowMeans(nes_mat, na.rm = TRUE), decreasing = TRUE), ]
+sig_m2_mat <- sig_m2_mat[rownames(nes_mat), ]
+
+# Clean names
+rownames(nes_mat)     <- gsub("HALLMARK_|_", " ", rownames(nes_mat))
+rownames(sig_m2_mat)  <- rownames(nes_mat)
+rownames(ann_row)     <- gsub("HALLMARK_|_", " ", rownames(ann_row))
+
+png(file.path(plot_dir, "Fig1_M2_NES_heatmap_with_significance.png"),
+    width = 10, height = max(6, nrow(nes_mat) * 0.38 + 2),
+    units = "in", res = 300)
+
+pheatmap(
+  nes_mat,
+  display_numbers = sig_m2_mat,
+  number_color    = "black",
+  fontsize_number = 10,
+  color           = colorRampPalette(c("#4e9af1", "white", "#e05c5c"))(100),
+  breaks          = seq(-3, 3, length.out = 101),
+  cluster_rows    = TRUE,
+  cluster_cols    = FALSE,
+  annotation_row  = ann_row,
+  annotation_colors = list(
+    M2_category = c(
+      Shared_all_up        = "#c0392b",
+      Shared_all_down      = "#2980b9",
+      Shared_all_divergent = "#f39c12",
+      Shared_TEA_TOC       = "#e67e22",
+      Shared_TEA_Tourette  = "#8e44ad",
+      Shared_TOC_Tourette  = "#27ae60",
+      Shared_2_divergent   = "#d35400",
+      Specific_TEA         = "#9b59b6",
+      Specific_TOC         = "#2ecc71",
+      Specific_Tourette    = "#1abc9c",
+      Borderline_consistent = "#95a5a6",
+      Borderline_1         = "#bdc3c7",
+      Not_enriched         = "#ecf0f1"
+    )
+  ),
+  fontsize_row  = 8,
+  fontsize_col  = 12,
+  border_color  = NA,
+  main          = "GSEA Hallmark — M2 NES (LPS vs Basal)\n* = FDR≤0.25  · = FDR≤0.40"
+)
+
+dev.off()
+message("Fig1 saved.")
+
+```
+
+### 6b. Bubble plot: NES vs -log10(FDR) per diagnosis
+
+```{r bubble_plot}
+
+# Reshape M2 results to long format for plotting
+bubble_df <- master %>%
+  filter(M2_n_tested >= 1) %>%
+  select(pathway, M2_category,
+         M2_TEA_NES, M2_TEA_FDR,
+         M2_TOC_NES, M2_TOC_FDR,
+         M2_Tourette_NES, M2_Tourette_FDR) %>%
+  pivot_longer(
+    cols = -c(pathway, M2_category),
+    names_to = c("diagnosis", ".value"),
+    names_pattern = "M2_(.+)_(NES|FDR)"
+  ) %>%
+  filter(!is.na(NES), !is.na(FDR)) %>%
+  mutate(
+    log10FDR   = -log10(FDR + 1e-10),
+    sig_label  = case_when(
+      FDR <= FDR_SIG        ~ "Significant",
+      FDR <= FDR_BORDERLINE ~ "Borderline",
+      TRUE                  ~ "NS"
+    ),
+    pathway_clean = gsub("HALLMARK_|_", " ", pathway)
+  )
+
+p_bubble <- ggplot(bubble_df,
+                   aes(x = NES, y = log10FDR,
+                       color = diagnosis, shape = sig_label,
+                       size  = abs(NES))) +
+  geom_hline(yintercept = -log10(FDR_SIG),        linetype = "dashed",
+             color = "grey40", linewidth = 0.5) +
+  geom_hline(yintercept = -log10(FDR_BORDERLINE), linetype = "dotted",
+             color = "grey60", linewidth = 0.4) +
+  geom_vline(xintercept = 0, color = "grey40", linewidth = 0.4) +
+  geom_point(alpha = 0.75) +
+  scale_color_manual(values = c("TEA"     = "#9b59b6",
+                                 "TOC"     = "#2ecc71",
+                                 "Tourette" = "#e05c5c")) +
+  scale_shape_manual(values = c("Significant" = 16,
+                                 "Borderline"  = 17,
+                                 "NS"          = 1)) +
+  scale_size_continuous(range = c(2, 6), guide = "none") +
+  facet_wrap(~ diagnosis, ncol = 3) +
+  labs(title    = "GSEA Hallmark — NES vs significance per diagnosis",
+       subtitle = "Dashed = FDR 0.25  |  Dotted = FDR 0.40",
+       x = "Normalized Enrichment Score (NES)",
+       y = "-log10(FDR)",
+       color = "Diagnosis", shape = "Significance") +
+  theme_bw(base_size = 12) +
+  theme(plot.title    = element_text(face = "bold"),
+        strip.text    = element_text(face = "bold"),
+        legend.position = "bottom")
+
+ggsave(file.path(plot_dir, "Fig2_bubble_NES_FDR.png"),
+       p_bubble, width = 14, height = 6, dpi = 300)
+message("Fig2 saved.")
+
+```
+
+### 6c. Scatter: NES TEA vs TOC vs Tourette pairwise
+
+```{r scatter_nes}
+
+make_scatter <- function(df, x_diag, y_diag, x_col, y_col,
+                         fdr_x, fdr_y) {
+
+  df_plot <- df %>%
+    dplyr::filter(!is.na(.data[[x_col]]), !is.na(.data[[y_col]])) %>%
+    dplyr::mutate(
+      sig_both = .data[[fdr_x]] <= FDR_SIG & .data[[fdr_y]] <= FDR_SIG,
+      sig_x    = .data[[fdr_x]] <= FDR_SIG & .data[[fdr_y]] > FDR_SIG,
+      sig_y    = .data[[fdr_y]] <= FDR_SIG & .data[[fdr_x]] > FDR_SIG,
+
+      point_color = dplyr::case_when(
+        sig_both ~ "Both significant",
+        sig_x    ~ paste0(x_diag, " only"),
+        sig_y    ~ paste0(y_diag, " only"),
+        TRUE     ~ "NS"
+      ),
+
+      pathway_clean = gsub("HALLMARK_|_", " ", pathway)
+    )
+
+  cor_val <- cor(df_plot[[x_col]], df_plot[[y_col]], use = "complete.obs")
+
+  # ---- FIXED COLOR VECTOR (no paste0 inside c()) ----
+  color_map <- c(
+    "Both significant" = "#c0392b",
+    "NS"               = "grey70"
+  )
+
+  color_map[paste0(x_diag, " only")] <- "#9b59b6"
+  color_map[paste0(y_diag, " only")] <- "#2ecc71"
+
+  ggplot(df_plot, aes(x = .data[[x_col]],
+                      y = .data[[y_col]],
+                      color = point_color)) +
+
+    geom_abline(slope = 1, intercept = 0, linetype = "dashed",
+                color = "grey50") +
+    geom_hline(yintercept = 0, color = "grey70", linewidth = 0.3) +
+    geom_vline(xintercept = 0, color = "grey70", linewidth = 0.3) +
+    geom_point(size = 3, alpha = 0.8) +
+
+    ggrepel::geom_text_repel(
+      data = df_plot %>% dplyr::filter(sig_both | sig_x | sig_y),
+      aes(label = pathway_clean),
+      size = 2.5, max.overlaps = 15
+    ) +
+
+    scale_color_manual(values = color_map) +
+
+    annotate("text", x = -Inf, y = Inf,
+             label = paste0("r = ", round(cor_val, 2)),
+             hjust = -0.2, vjust = 1.5,
+             size = 4, fontface = "italic") +
+
+    labs(
+      title    = paste("NES comparison:", x_diag, "vs", y_diag),
+      subtitle = "Diagonal = perfect concordance",
+      x        = paste("NES", x_diag),
+      y        = paste("NES", y_diag),
+      color    = "Significance"
+    ) +
+
+    theme_bw(base_size = 12) +
+    theme(
+      plot.title = element_text(face = "bold"),
+      legend.position = "bottom"
+    )
+}
+
+# Install ggrepel if needed: install.packages("ggrepel")
+library(ggrepel)
+
+p_tea_toc <- make_scatter(
+  master, "TEA", "TOC",
+  "M2_TEA_NES", "M2_TOC_NES",
+  "M2_TEA_FDR", "M2_TOC_FDR"
+)
+p_tea_ts <- make_scatter(
+  master, "TEA", "Tourette",
+  "M2_TEA_NES", "M2_Tourette_NES",
+  "M2_TEA_FDR", "M2_Tourette_FDR"
+)
+p_toc_ts <- make_scatter(
+  master, "TOC", "Tourette",
+  "M2_TOC_NES", "M2_Tourette_NES",
+  "M2_TOC_FDR", "M2_Tourette_FDR"
+)
+
+ggsave(file.path(plot_dir, "Fig3a_scatter_TEA_vs_TOC.png"),
+       p_tea_toc, width = 7, height = 6, dpi = 300)
+ggsave(file.path(plot_dir, "Fig3b_scatter_TEA_vs_Tourette.png"),
+       p_tea_ts, width = 7, height = 6, dpi = 300)
+ggsave(file.path(plot_dir, "Fig3c_scatter_TOC_vs_Tourette.png"),
+       p_toc_ts, width = 7, height = 6, dpi = 300)
+message("Fig3 scatter plots saved.")
+
+```
+
+
+
+
+
+

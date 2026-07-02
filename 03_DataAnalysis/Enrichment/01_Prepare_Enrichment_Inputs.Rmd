@@ -1,0 +1,352 @@
+---
+title: "02_Prepare_Enrichment_Inputs"
+output: html_document
+date: "2026-03-25"
+---
+
+## 0. Libraries and paths
+
+```{r setup}
+
+library(dplyr)
+library(tibble)
+
+deg_dir   <- "/home/jose/Desktop/RNAseq/results/counts/bulk/DEG/DESeq2"
+gsea_dir  <- "/home/jose/Desktop/RNAseq/results/Enrichment/GSEA_inputs"
+david_dir <- "/home/jose/Desktop/RNAseq/results/Enrichment/DAVID_inputs"
+
+dir.create(gsea_dir,  recursive = TRUE, showWarnings = FALSE)
+dir.create(david_dir, recursive = TRUE, showWarnings = FALSE)
+
+# Thresholds 
+FDR <- 0.05
+FC  <- 1
+
+```
+
+## 1. Helper functions
+
+```{r helpers}
+
+# ── Load a DESeq2 result CSV ──────────────────────────────────────────────────
+load_res <- function(filename) {
+  path <- file.path(deg_dir, filename)
+  if (!file.exists(path)) {
+    message("File not found — skipping: ", filename)
+    return(NULL)
+  }
+  df <- read.csv(path, stringsAsFactors = FALSE)
+  message("Loaded: ", filename, "  (", nrow(df), " genes, columns: ", paste(colnames(df), collapse = ", "), ")")
+  df
+}
+
+# ── Save GSEA .rnk file ───────────────────────────────────────────────────────
+# GSEA expects: two columns, no header, tab-separated, sorted descending
+# Ranking priority: stat (Wald) > log2FoldChange
+# stat is preferred because it incorporates both effect size and variance
+# log2FoldChange is used as fallback when stat is absent (e.g. after lfcShrink)
+save_rnk <- function(res_df, name) {
+
+  if (is.null(res_df)) {
+    message("Skipping RNK — NULL input: ", name)
+    return(invisible(NULL))
+  }
+
+  # Choose ranking column
+  if ("stat" %in% colnames(res_df) && !all(is.na(res_df$stat))) {
+    rank_col <- "stat"
+  } else if ("log2FoldChange" %in% colnames(res_df)) {
+    rank_col <- "log2FoldChange"
+    message("  Note: using log2FoldChange for ranking (stat not available) — ",
+            name)
+  } else {
+    message("  No ranking column found — skipping: ", name)
+    return(invisible(NULL))
+  }
+
+  rnk <- res_df %>%
+    filter(!is.na(.data[[rank_col]]), !is.na(gene), gene != "") %>%
+    distinct(gene, .keep_all = TRUE) %>%
+    select(gene, all_of(rank_col)) %>%
+    arrange(desc(.data[[rank_col]]))
+
+  path <- file.path(gsea_dir, paste0(name, ".rnk"))
+  write.table(rnk, file = path,
+              sep       = "\t",
+              quote     = FALSE,
+              row.names = FALSE,
+              col.names = FALSE)
+
+  message("RNK saved [", rank_col, "]: ", basename(path),
+          "  (", nrow(rnk), " genes)")
+}
+
+# ── Save DAVID .txt gene list ─────────────────────────────────────────────────
+# DAVID expects: one gene symbol per line, no header
+# direction: "up", "down", or "all"
+save_david <- function(res_df, name, direction = "all") {
+
+  if (is.null(res_df)) {
+    message("Skipping DAVID — NULL input: ", name)
+    return(invisible(NULL))
+  }
+
+  genes <- switch(direction,
+    up   = res_df$gene[!is.na(res_df$padj) &
+                        res_df$padj < FDR &
+                        res_df$log2FoldChange > FC],
+    down = res_df$gene[!is.na(res_df$padj) &
+                        res_df$padj < FDR &
+                        res_df$log2FoldChange < -FC],
+    all  = res_df$gene[!is.na(res_df$padj) &
+                        res_df$padj < FDR &
+                        abs(res_df$log2FoldChange) > FC]
+  )
+
+  genes <- genes[!is.na(genes) & genes != ""]
+
+  if (length(genes) == 0) {
+    message("No genes for DAVID — ", name, " (", direction, ") — skipping")
+    return(invisible(NULL))
+  }
+
+  path <- file.path(david_dir, paste0(name, "_", direction, ".txt"))
+  writeLines(genes, con = path)
+  message("DAVID saved: ", basename(path), "  (", length(genes), " genes)")
+}
+
+# ── Save DAVID .txt from plain gene vector (ANOVA / integration categories) ───
+save_david_genes <- function(gene_vector, name) {
+
+  genes <- gene_vector[!is.na(gene_vector) & gene_vector != ""]
+
+  if (length(genes) == 0) {
+    message("No genes for DAVID — ", name, " — skipping")
+    return(invisible(NULL))
+  }
+
+  path <- file.path(david_dir, paste0(name, ".txt"))
+  writeLines(genes, con = path)
+  message("DAVID saved: ", basename(path), "  (", length(genes), " genes)")
+}
+
+```
+
+## 2. Load all DEG results
+
+```{r load}
+
+# M1 — LPS vs Basal global
+res_M1 <- load_res("M1.1_LPS_vs_Basal_results.csv")
+
+# M2 — LPS vs Basal per diagnosis
+res_M2_TEA      <- load_res("M2_LPS_vs_Basal_TEA_results.csv")
+res_M2_TOC      <- load_res("M2_LPS_vs_Basal_TOC_results.csv")
+res_M2_Tourette <- load_res("M2_LPS_vs_Basal_Tourette_results.csv")
+
+# M3 — Between diagnoses in Basal
+res_M3_ASD_OCD <- load_res("M3.1_Basal_ASD_vs_OCD_results.csv")
+res_M3_ASD_TS  <- load_res("M3.2_Basal_ASD_vs_TS_results.csv")
+res_M3_OCD_TS  <- load_res("M3.3_Basal_OCD_vs_TS_results.csv")
+res_M3_anova   <- load_res("M3_ANOVA_Basal_global.csv")
+
+# M4 — Between diagnoses in LPS
+res_M4_ASD_OCD <- load_res("M4.1_LPS_ASD_vs_OCD_results.csv")
+res_M4_ASD_TS  <- load_res("M4.2_LPS_ASD_vs_TS_results.csv")
+res_M4_OCD_TS  <- load_res("M4.3_LPS_OCD_vs_TS_results.csv")
+res_M4_anova   <- load_res("M4_ANOVA_LPS_global.csv")
+
+# M6 — Integration categories
+integration_df <- load_res("M6_ANOVA_integration.csv")
+
+# Check stat column availability
+message("\n=== STAT COLUMN CHECK ===")
+for (name in c("res_M1", "res_M2_TEA", "res_M2_TOC", "res_M2_Tourette",
+               "res_M3_ASD_OCD", "res_M3_ASD_TS", "res_M3_OCD_TS",
+               "res_M4_ASD_OCD", "res_M4_ASD_TS", "res_M4_OCD_TS")) {
+  obj <- get(name)
+  if (!is.null(obj)) {
+    has_stat <- "stat" %in% colnames(obj) && !all(is.na(obj$stat))
+    message("  ", name, ": stat = ", ifelse(has_stat, "YES", "NO — will use log2FC"))
+  }
+}
+
+```
+
+## 3. M1 — LPS vs Basal global
+
+GSEA: full ranking — reveals pathways with coordinated moderate changes
+DAVID: significant DEGs only — confirms strongest pathway hits
+
+```{r M1}
+
+# GSEA
+save_rnk(res_M1, "M1_LPS_vs_Basal_global")
+
+# DAVID — up and down separately to see directionality
+save_david(res_M1, "M1_LPS_vs_Basal_global", direction = "up")
+save_david(res_M1, "M1_LPS_vs_Basal_global", direction = "down")
+
+```
+
+## 4. M2 — LPS vs Basal per diagnosis
+
+GSEA: one ranked list per diagnosis — key comparison for diagnosis-specific LPS response
+DAVID: significant DEGs per diagnosis, up and down separately
+
+```{r M2}
+
+# GSEA — one per diagnosis
+save_rnk(res_M2_TEA,      "M2_LPS_vs_Basal_TEA")
+save_rnk(res_M2_TOC,      "M2_LPS_vs_Basal_TOC")
+save_rnk(res_M2_Tourette, "M2_LPS_vs_Basal_Tourette")
+
+# DAVID — up and down per diagnosis
+save_david(res_M2_TEA,      "M2_LPS_vs_Basal_TEA",      direction = "up")
+save_david(res_M2_TEA,      "M2_LPS_vs_Basal_TEA",      direction = "down")
+save_david(res_M2_TOC,      "M2_LPS_vs_Basal_TOC",      direction = "up")
+save_david(res_M2_TOC,      "M2_LPS_vs_Basal_TOC",      direction = "down")
+save_david(res_M2_Tourette, "M2_LPS_vs_Basal_Tourette", direction = "up")
+save_david(res_M2_Tourette, "M2_LPS_vs_Basal_Tourette", direction = "down")
+
+```
+
+## 5. M3 — Between diagnoses in Basal
+
+GSEA: stat available from results() — uses full ranking to detect subtle
+      pathway differences between diagnoses at baseline
+DAVID: significant DEGs from pairwise + ANOVA global
+
+```{r M3}
+
+# GSEA — pairwise rankings
+save_rnk(res_M3_ASD_OCD, "M3_Basal_ASD_vs_OCD")
+save_rnk(res_M3_ASD_TS,  "M3_Basal_ASD_vs_TS")
+save_rnk(res_M3_OCD_TS,  "M3_Basal_OCD_vs_TS")
+
+# DAVID — pairwise up/down
+save_david(res_M3_ASD_OCD, "M3_Basal_ASD_vs_OCD", direction = "up")
+save_david(res_M3_ASD_OCD, "M3_Basal_ASD_vs_OCD", direction = "down")
+save_david(res_M3_ASD_TS,  "M3_Basal_ASD_vs_TS",  direction = "up")
+save_david(res_M3_ASD_TS,  "M3_Basal_ASD_vs_TS",  direction = "down")
+save_david(res_M3_OCD_TS,  "M3_Basal_OCD_vs_TS",  direction = "up")
+save_david(res_M3_OCD_TS,  "M3_Basal_OCD_vs_TS",  direction = "down")
+
+# DAVID — ANOVA global (no direction — any difference among 3 diagnoses)
+if (!is.null(res_M3_anova)) {
+  sig_anova_basal <- res_M3_anova$gene[
+    !is.na(res_M3_anova$padj) & res_M3_anova$padj < FDR
+  ]
+  save_david_genes(sig_anova_basal, "M3_ANOVA_Basal_global")
+}
+
+```
+
+## 6. M4 — Between diagnoses in LPS
+
+Same rationale as M3 but under LPS stimulation.
+Comparing GSEA/DAVID results between M3 and M4 reveals which pathways are:
+  - Constitutive differences (appear in both)
+  - Baseline-only (only in M3)
+  - LPS-revealed (only in M4)
+
+```{r M4}
+
+# GSEA — pairwise rankings
+save_rnk(res_M4_ASD_OCD, "M4_LPS_ASD_vs_OCD")
+save_rnk(res_M4_ASD_TS,  "M4_LPS_ASD_vs_TS")
+save_rnk(res_M4_OCD_TS,  "M4_LPS_OCD_vs_TS")
+
+# DAVID — pairwise up/down
+save_david(res_M4_ASD_OCD, "M4_LPS_ASD_vs_OCD", direction = "up")
+save_david(res_M4_ASD_OCD, "M4_LPS_ASD_vs_OCD", direction = "down")
+save_david(res_M4_ASD_TS,  "M4_LPS_ASD_vs_TS",  direction = "up")
+save_david(res_M4_ASD_TS,  "M4_LPS_ASD_vs_TS",  direction = "down")
+save_david(res_M4_OCD_TS,  "M4_LPS_OCD_vs_TS",  direction = "up")
+save_david(res_M4_OCD_TS,  "M4_LPS_OCD_vs_TS",  direction = "down")
+
+# DAVID — ANOVA global
+if (!is.null(res_M4_anova)) {
+  sig_anova_lps <- res_M4_anova$gene[
+    !is.na(res_M4_anova$padj) & res_M4_anova$padj < FDR
+  ]
+  save_david_genes(sig_anova_lps, "M4_ANOVA_LPS_global")
+}
+
+```
+
+## 7. M6 — Integration categories
+
+No GSEA here — integration categories are gene lists without an associated
+ranking statistic. DAVID only.
+
+Each category tells a different biological story:
+  Only_Basal:            differ at baseline, converge under LPS
+  Only_LPS:              equal at baseline, diverge under LPS stimulation
+  Basal_and_LPS_same_FC: constitutive difference preserved in both states
+  All_three:             differ in expression level AND LPS response magnitude
+
+```{r M6}
+
+if (!is.null(integration_df)) {
+
+  categories <- c("Only_Basal", "Only_LPS",
+                  "Basal_and_LPS_same_FC", "All_three")
+
+  for (cat in categories) {
+    genes <- integration_df$gene[
+      !is.na(integration_df$category) & integration_df$category == cat
+    ]
+    save_david_genes(genes, paste0("M6_", cat))
+  }
+}
+
+```
+
+## 8. Summary and GSEA Desktop instructions
+
+```{r summary}
+
+gsea_files  <- list.files(gsea_dir,  pattern = "\\.rnk$")
+david_files <- list.files(david_dir, pattern = "\\.txt$")
+
+message("=== INPUT FILES GENERATED ===")
+message("\nGSEA .rnk files (", length(gsea_files), "):")
+for (f in sort(gsea_files)) message("  ", f)
+
+message("\nDAVID .txt files (", length(david_files), "):")
+for (f in sort(david_files)) message("  ", f)
+
+message("\n=== GSEA DESKTOP INSTRUCTIONS ===")
+message("\nGene set databases to download from msigdb.org:")
+message("  h.all.v2023.1.Hs.symbols.gmt          Hallmark (start here)")
+message("  c5.go.bp.v2023.1.Hs.symbols.gmt        GO Biological Process")
+message("  c2.cp.kegg_medicus.v2023.1.Hs.symbols.gmt  KEGG Medicus")
+message("  c2.cp.reactome.v2023.1.Hs.symbols.gmt  Reactome")
+message("  c7.immunesigdb.v2023.1.Hs.symbols.gmt  Immunological (key for this study)")
+
+message("\nGSEA Desktop settings for each .rnk file:")
+message("  Analysis type:    GSEAPreranked")
+message("  Collapse/Remap:   No_Collapse  (already gene symbols)")
+message("  Min gene set:     15")
+message("  Max gene set:     500")
+message("  Permutations:     1000")
+message("  Scoring scheme:   weighted (default)")
+
+message("\nRecommended analysis order:")
+message("  1. M1 + Hallmark      — broad overview of LPS biology")
+message("  2. M2 (3x) + Hallmark — compare LPS response across diagnoses")
+message("  3. M2 (3x) + C7       — immune-specific LPS response per diagnosis")
+message("  4. M3/M4 + GO BP      — baseline and LPS-state pathway differences")
+message("  5. All + Reactome     — detailed pathway resolution")
+
+message("\n=== DAVID INSTRUCTIONS ===")
+message("  URL: david.ncifcrf.gov")
+message("  Upload each .txt file → paste or upload gene list")
+message("  Identifier: OFFICIAL_GENE_SYMBOL")
+message("  Species: Homo sapiens")
+message("  Run: Functional Annotation Clustering")
+message("  Focus on: GOTERM_BP, KEGG_PATHWAY, REACTOME_PATHWAY")
+message("  Export results as .txt for ClueGO")
+
+```

@@ -1,0 +1,406 @@
+---
+title: "02_final_version"
+output: html_document
+date: "2026-03-24"
+---
+Batch correction of bulk raw counts using ComBat-Seq:
+ - Loads raw count matrix (gene-level)
+ - Builds sample metada (batch, treatment, diagnosis) from sample names and merge
+ - PCA pre/post (logCPM) for QC
+ - Applies ComBat-Seq preserving biological structure
+ - Saves corrected/CPM-corrected/logCPM-corrected matrices + PCA and Heatmaps plots
+
+
+## 0. Configuration directories and libraries
+
+Include all necessary libraries and paths to the corresponding files
+
+```{r setup}
+
+library(sva)
+library(ggplot2)
+library(dplyr)
+library(pheatmap)
+library(RColorBrewer)
+
+in_dir   <- "/home/jose/Desktop/RNAseq/results/counts/bulk/"
+diagnosis_dir <- "/home/jose/Desktop/RNAseq/data/Diagnosis_data"
+out_dir  <- "/home/jose/Desktop/RNAseq/results/counts/bulk/"
+plot_dir <- "/home/jose/Desktop/RNAseq/results/plots/combatseq"
+dir.create(plot_dir, recursive = TRUE, showWarnings = FALSE)
+
+# Acces to data
+
+in_counts   <- file.path(in_dir, "rawcounts.csv")
+in_diagnosis <- file.path(diagnosis_dir, "Mostres_RNAseqJose.csv")
+
+```
+
+## 1. Load counts
+
+Generate the dataframe to extract the information
+
+```{r counts}
+
+rawcounts_df <- read.csv(in_counts, header = TRUE, stringsAsFactors = FALSE, check.names = FALSE)
+colnames(rawcounts_df)[1] <- "Gene"
+rawcounts_df[, -1] <- lapply(rawcounts_df[, -1, drop = FALSE], as.numeric)
+
+rawcounts <- as.matrix(rawcounts_df[, -1, drop = FALSE])
+rownames(rawcounts) <- rawcounts_df$Gene
+
+# Checks
+
+stopifnot(is.matrix(rawcounts))
+stopifnot(nrow(rawcounts) > 0, ncol(rawcounts) > 0)
+stopifnot(all(colSums(rawcounts) > 0))
+
+message("Counts loaded: ", nrow(rawcounts), " genes x ", ncol(rawcounts), " samples")
+
+```
+
+## 2. Build coldata
+
+Generate subgroups to consider the batch and treatment
+
+```{r coldata}
+
+sample_names <- colnames(rawcounts)
+
+# Extract Batch (e.g. FC1. FC2, FC3) and treatment (e.g. Basal, LPS)
+
+batch <- ifelse(grepl("_FC1_", sample_names, ignore.case = TRUE), "FC1",
+                ifelse(grepl("_FC2_", sample_names, ignore.case = TRUE), "FC2", "FC3"))
+
+if (all(batch == "FC3")) {
+  warning("All batches assigned to FC3. Check '_FC1_', '_FC2_' patterns in sample names.")
+  message("Sample name examples: ", paste(head(sample_names, 3), collapse = " | "))
+}
+message("Batch distribution:"); print(table(batch))
+
+treatment <- ifelse(grepl("basal", sample_names, ignore.case = TRUE), "Basal", "LPS")
+message("Treatment distribution:"); print(table(treatment))
+
+# Extract donor ID for posterior merge with Diagnosis (assumes pattern SXXX_NNN at start)
+
+donor_id <- sub("^[^_]+_[^_]+_([^_]+)_.*", "\\1", sample_names)
+
+coldata <- data.frame(
+  sample    = sample_names,
+  treatment = factor(treatment, levels = c("Basal", "LPS")),
+  batch     = factor(batch),
+  donor_id  = factor(donor_id),
+  stringsAsFactors = FALSE
+)
+rownames(coldata) <- sample_names
+
+```
+
+## 3. Merge diagnosis data
+
+Extract data from the diagnosis file and match it with the general dataframe 
+
+```{r diagnosis}
+meta_df <- read.csv(in_diagnosis, header=TRUE, stringsAsFactors = FALSE, check.names = FALSE)
+
+# Consider the titles of columns to extract the data
+
+meta_id_col   <- "Sample_ID"   # column with partial sample ID (e.g. "CRR01")
+meta_diag_col <- "Diagnosis"    # column with diagnosis label (e.g. "TEA", "TOC", "Tourette")
+
+# Match information of both side
+
+coldata$diagnosis <- meta_df[[meta_diag_col]][match(coldata$donor_id, meta_df[[meta_id_col]])]
+
+# Keep only first diagnostic in combined labels (e.g."TOC+TEA" -> "TOC")
+
+coldata$diagnosis <- sub("\\+.*", "", coldata$diagnosis)
+
+# Check that all samples did match to a diagnosis
+
+if (any(is.na(coldata$diagnosis))) {
+  message("Some diagnoses did not match directly. Trying partial match...")
+  for (i in which(is.na(coldata$diagnosis))) {hit <- which(sapply(meta_df[[meta_id_col]],function(id) grepl(id, coldata$donor_id[i], fixed = TRUE))) 
+if (length(hit) == 1) coldata$diagnosis[i] <- meta_df[[meta_diag_col]][hit]}}
+
+n_na_diag <- sum(is.na(coldata$diagnosis))
+
+if (n_na_diag > 0) {
+  warning(n_na_diag, " samples without diagnosis. Check 'meta_id_col'.")
+  print(coldata[is.na(coldata$diagnosis), c("sample", "donor_id")])} else {message("Diagnosis assigned to all samples successfully.")}
+
+coldata$diagnosis <- factor(coldata$diagnosis)
+
+message("Diagnosis distribution:"); print(table(coldata$diagnosis))
+```
+
+## 4. Processing/Normalizing for PCA (logCPM)
+
+Normalization by logCPM and Heatmap generation
+
+```{r}
+# logCPM + PCA
+
+calc_logcpm_pca <- function(count_matrix, coldata, scale_pca = TRUE) {
+
+  lib_sizes <- colSums(count_matrix)
+  cpm <- t(t(count_matrix) / lib_sizes * 1e6)
+  logcpm <- log2(cpm + 1)
+  
+  # Select 500 genes and variables for a clean PCA
+  var_genes <- apply(logcpm, 1, var)
+  select_genes <- names(sort(var_genes, decreasing = TRUE))[1:min(500, length(var_genes))]
+  logcpm_top <- logcpm[select_genes, , drop = FALSE]
+  
+  # PCA (Use scale = TRUE making a standardization of each gene to emphasize in relative expression patterns across samples instead in only genes with large absolute variance)
+  pca <- prcomp(t(logcpm_top), scale. = scale_pca)
+  percentVar <- round(100 * (pca$sdev^2 / sum(pca$sdev^2)), 1)
+  
+  pca_df <- as.data.frame(pca$x[, 1:2])
+  pca_df <- cbind(pca_df, coldata[rownames(pca_df), ])
+  
+  list(pca_df = pca_df, percentVar = percentVar, logcpm = logcpm)
+}
+
+# Heatmap 
+
+make_heatmap <- function(logcpm_matrix, annotation_vars, title,
+                         out_file, top_n = 500) {
+  
+  # Select top N most variable genes
+  var_genes  <- apply(logcpm_matrix, 1, var)
+  top_genes  <- names(sort(var_genes, decreasing = TRUE))[1:min(top_n, length(var_genes))]
+  mat        <- logcpm_matrix[top_genes, , drop = FALSE]
+  
+  # Scale rows (z-score) for better visual contrast
+  mat_scaled <- t(scale(t(mat)))
+  
+  # Build annotation dataframe
+  ann_df <- coldata[colnames(mat), annotation_vars, drop = FALSE]
+  
+  # Build annotation colors
+  ann_colors <- list()
+  
+  if ("treatment" %in% annotation_vars) {
+    ann_colors$treatment <- c("Basal" = "#4e9af1", "LPS" = "#e05c5c")
+  }
+  
+  if ("diagnosis" %in% annotation_vars) {
+    diag_levels <- levels(coldata$diagnosis)
+    diag_pal    <- brewer.pal(max(3, length(diag_levels)), "Set1")[seq_along(diag_levels)]
+    names(diag_pal) <- diag_levels
+    ann_colors$diagnosis <- diag_pal
+  }
+  
+  if ("batch" %in% annotation_vars) {
+    batch_levels <- levels(coldata$batch)
+    batch_pal    <- brewer.pal(max(3, length(batch_levels)), "Dark2")[seq_along(batch_levels)]
+    names(batch_pal) <- batch_levels
+    ann_colors$batch <- batch_pal
+  }
+  
+  # Draw and save heatmap
+  png(out_file, width = 10, height = 9, units = "in", res = 300)
+  pheatmap(
+    mat_scaled,
+    annotation_col  = ann_df,
+    annotation_colors = ann_colors,
+    cluster_rows    = TRUE,
+    cluster_cols    = TRUE,
+    show_rownames   = FALSE,
+    show_colnames   = FALSE,
+    fontsize         = 9,
+    color            = colorRampPalette(rev(brewer.pal(11, "RdBu")))(100),
+    main             = title,
+    border_color     = NA
+  )
+  dev.off()
+  message("Heatmap saved: ", out_file)
+}
+
+```
+
+## 5. PCA previous pre-correction via ComBat-Seq
+
+```{r previous PCA}
+
+pre <- calc_logcpm_pca(rawcounts, coldata)
+
+# PCA Plot 1: Raw counts — treatment + batch ------------------------------
+p1 <- ggplot(pre$pca_df, aes(x = PC1, y = PC2,
+                             color = treatment, shape = batch)) +
+  geom_point(size = 4, alpha = 0.8) +
+  scale_color_manual(values = c("Basal" = "#4e9af1", "LPS" = "#e05c5c")) +
+  labs(title    = "1. Plot — Raw Counts (Pre-ComBat)",
+       subtitle = "Color = Treatment  |  Shape = Batch",
+       x = paste0("PC1: ", pre$percentVar[1], "% variance"),
+       y = paste0("PC2: ", pre$percentVar[2], "% variance")) +
+  theme_bw(base_size = 13) +
+  theme(plot.title = element_text(face = "bold"))
+
+ggsave(file.path(plot_dir, "1.Plot_PCA_RawCounts.png"),
+       p1, width = 7, height = 6, dpi = 300)
+message("Plot 1 saved.")
+
+# Heatmap 1: Raw counts — treatment only ----------------------------------
+make_heatmap(
+  logcpm_matrix   = pre$logcpm,
+  annotation_vars = "treatment",
+  title    = "1.Heatmap — Raw Counts | Top 500 variable genes (Treatment)",
+  out_file = file.path(plot_dir, "1.Heatmap_Raw_Treatment.png")
+)
+
+```
+
+## 6. Applicate ComBat- Seq (Correct technical problems such as Batch effect)
+
+```{r ComBat-Seq}
+combatseqcounts <- ComBat_seq(
+  counts = rawcounts,
+  batch = coldata$batch,
+  group = coldata$treatment
+)
+```
+
+## 7. PCA post-correction via ComBat-Seq
+
+```{r post PCA}
+
+post <- calc_logcpm_pca(combatseqcounts, coldata)
+
+# PCA Plot 2: Post-ComBat — treatment + batch (batch QC) ------------------
+p2 <- ggplot(post$pca_df, aes(x = PC1, y = PC2,
+                              color = treatment, shape = batch)) +
+  geom_point(size = 4, alpha = 0.8) +
+  scale_color_manual(values = c("Basal" = "#4e9af1", "LPS" = "#e05c5c")) +
+  labs(title    = "2. Plot — Post-ComBat-Seq (Batch corrected)",
+       subtitle = "Color = Treatment  |  Shape = Batch",
+       x = paste0("PC1: ", post$percentVar[1], "% variance"),
+       y = paste0("PC2: ", post$percentVar[2], "% variance")) +
+  theme_bw(base_size = 13) +
+  theme(plot.title = element_text(face = "bold"))
+
+ggsave(file.path(plot_dir, "2.Plot_PCA_PostComBat_BatchQC.png"),
+       p2, width = 7, height = 6, dpi = 300)
+message("Plot 2 saved.")
+
+# PCA Plot 3: Post-ComBat — diagnosis + treatment (biological variance) ---
+p3 <- ggplot(post$pca_df, aes(x = PC1, y = PC2,
+                              color = diagnosis, shape = treatment)) +
+  geom_point(size = 4, alpha = 0.8) +
+  scale_color_brewer(palette = "Set1", na.value = "grey60") +
+  labs(title    = "3. Plot — Post-ComBat-Seq (Biological variance)",
+       subtitle = "Color = Diagnosis  |  Shape = Treatment",
+       x = paste0("PC1: ", post$percentVar[1], "% variance"),
+       y = paste0("PC2: ", post$percentVar[2], "% variance")) +
+  theme_bw(base_size = 13) +
+  theme(plot.title = element_text(face = "bold"))
+
+ggsave(file.path(plot_dir, "3.Plot_PCA_PostComBat_Diagnosis.png"),
+       p3, width = 7, height = 6, dpi = 300)
+message("Plot 3 saved.")
+
+# Heatmap 2: Post-ComBat — treatment only ---------------------------------
+make_heatmap(
+  logcpm_matrix   = post$logcpm,
+  annotation_vars = "treatment",
+  title    = "2.Heatmap — Post-ComBat-Seq | Top 500 variable genes (Treatment)",
+  out_file = file.path(plot_dir, "2.Heatmap_PostComBat_Treatment.png")
+)
+
+## Heatmap 3: Post-ComBat — treatment + diagnosis --------------------------
+make_heatmap(
+  logcpm_matrix   = post$logcpm,
+  annotation_vars = c("treatment", "diagnosis"),
+  title    = "3.Heatmap — Post-ComBat-Seq | Top 500 variable genes (Treatment + Diagnosis)",
+  out_file = file.path(plot_dir, "3.Heatmap_PostComBat_Treatment_Diagnosis.png")
+)
+
+```
+
+## 8. Donor effect correction for visualization
+
+By the use of removeBatchEffect data is corrected considering that donor effect whereas protecting the variance of interest
+
+```{r donor effect}
+
+library(limma)
+
+logcpm_no_donor <- removeBatchEffect(
+  post$logcpm,
+  batch = coldata$donor_id,        # removes inter-individual baseline shifts
+  design = model.matrix(~ treatment, data = coldata)  # preserves treatment effect
+)
+
+# PCA on donor-corrected logCPM
+var_genes_d  <- apply(logcpm_no_donor, 1, var)
+top_genes_d  <- names(sort(var_genes_d, decreasing = TRUE))[1:min(500, sum(var_genes_d > 0))]
+pca_donor    <- prcomp(t(logcpm_no_donor[top_genes_d, ]), scale. = FALSE)
+pctVar_donor <- round(100 * (pca_donor$sdev^2 / sum(pca_donor$sdev^2)), 1)
+
+pca_df_donor <- as.data.frame(pca_donor$x[, 1:2])
+pca_df_donor <- cbind(pca_df_donor, coldata[rownames(pca_df_donor), , drop = FALSE])
+
+## Plot 4: Donor-corrected — treatment + batch -----------------------------
+p4 <- ggplot(pca_df_donor, aes(x = PC1, y = PC2,
+                               color = treatment, shape = batch)) +
+  geom_point(size = 4, alpha = 0.8) +
+  scale_color_manual(values = c("Basal" = "#4e9af1", "LPS" = "#e05c5c")) +
+  labs(title    = "4. Plot — Donor-corrected (Visualization only)",
+       subtitle = "Color = Treatment  |  Shape = Batch",
+       x = paste0("PC1: ", pctVar_donor[1], "% variance"),
+       y = paste0("PC2: ", pctVar_donor[2], "% variance")) +
+  theme_bw(base_size = 13) +
+  theme(plot.title   = element_text(face = "bold"),
+        plot.caption = element_text(color = "firebrick", size = 8))
+
+ggsave(file.path(plot_dir, "4.Plot_PCA_DonorCorrected_Treatment.png"),
+       p4, width = 7, height = 6, dpi = 300)
+message("Plot 4 saved.")
+
+## Plot 5: Donor-corrected — diagnosis + treatment -------------------------
+p5 <- ggplot(pca_df_donor, aes(x = PC1, y = PC2,
+                               color = diagnosis, shape = treatment)) +
+  geom_point(size = 4, alpha = 0.8) +
+  scale_color_brewer(palette = "Set1", na.value = "grey60") +
+  labs(title    = "5.Plot — Donor-corrected (Biological variance)",
+       subtitle = "Color = Diagnosis  |  Shape = Treatment",
+       x = paste0("PC1: ", pctVar_donor[1], "% variance"),
+       y = paste0("PC2: ", pctVar_donor[2], "% variance")) +
+  theme_bw(base_size = 13) +
+  theme(plot.title   = element_text(face = "bold"),
+        plot.caption = element_text(color = "firebrick", size = 8))
+
+ggsave(file.path(plot_dir, "5.Plot_PCA_DonorCorrected_Diagnosis.png"),
+       p5, width = 7, height = 6, dpi = 300)
+message("Plot 5 saved.")
+
+## Heatmap 4: Donor-corrected — treatment + diagnosis [Visualization only] -
+make_heatmap(
+  logcpm_matrix   = logcpm_no_donor,
+  annotation_vars = c("treatment", "diagnosis"),
+  title    = "4.Heatmap — Donor-corrected | Top 500 variable genes (Treatment + Diagnosis) [Visualization only]",
+  out_file = file.path(plot_dir, "4.Heatmap_DonorCorrected_Treatment_Diagnosis.png")
+)
+
+```
+
+
+## 9. Save corrected counts
+
+```{r corrected counts}
+
+combatseqcounts_df <- data.frame(Gene = rownames(combatseqcounts), combatseqcounts, check.names = FALSE)
+
+write.csv(combatseqcounts_df, file=file.path(out_dir, "rawcounts_ComBatSeq.csv"), row.names = FALSE)
+
+```
+
+
+
+
+
+
+
+
+

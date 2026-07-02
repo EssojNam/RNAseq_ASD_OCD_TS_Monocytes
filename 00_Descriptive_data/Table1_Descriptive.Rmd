@@ -1,0 +1,408 @@
+---
+title: "Table1_Descriptive"
+output: html_document
+date: "2026-05-15"
+---
+
+## 0. Libraries and paths
+
+```{r setup, message=FALSE, warning=FALSE}
+
+# install.packages(c("haven", "gt", "gtsummary", "dplyr", "lubridate", "forcats"))
+library(haven)
+library(gt)
+library(gtsummary)
+library(dplyr)
+library(lubridate)
+library(tidyr)
+library(stringr)
+library(forcats)
+
+spss_path <- "/home/jose/Desktop/RNAseq/data/Diagnosis_data/bbddtfg_NataliaCongreso.sav"
+out_dir   <- "/home/jose/Desktop/RNAseq/results/Descriptive"
+dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+
+```
+
+---
+
+## 1. Load and prepare data
+
+```{r prepare}
+
+df_raw <- read_sav(spss_path)
+
+## 1b. Exclude specific subjects
+
+# List the CODIGO values to exclude
+excluded_codes <- c("CRR_07","CRR_13","CRR_19","CRR_20","CRR_39","CRR_44","CRR45","CRR_47")
+
+message("Subjects before exclusion: ", nrow(df_raw))
+
+df_raw <- df_raw %>%
+  filter(!CODIGO %in% excluded_codes)
+
+message("Subjects after exclusion: ", nrow(df_raw))
+message("Excluded: ", paste(excluded_codes, collapse = ", "))
+
+med_levels <- c("0","1","2","3","4","5","6","7","8","9")
+med_labels <- c("SSRI", "Atypical antipsychotic", "Methylphenidate",
+                    "Benzodiazepines", "Adrenergic agonist", "Anticonvulsant (topiramate)",
+                    "Mood stabilizer", "Atomoxetine",
+                    "Tricyclic antidepressant", "Pimozide")
+
+df <- df_raw %>%
+  mutate(
+
+    # ── Diagnosis ─────────────────────────────────────────────────────────────
+    # GRUPO: 0=TOC, 1=TT (Tourette), 2=TEA
+    Diagnosis = factor(as.numeric(GRUPO),
+                       levels = c(0, 1, 2),
+                       labels = c("OCD", "Tourette", "ASD")),
+
+    # ── Age (already in years as decimal) ────────────────────────────────────
+    Age = as.numeric(EDAD),
+
+    # ── Age of onset ─────────────────────────────────────────────────────────
+    # Age at evaluation minus duration of illness (both in years)
+    Duration_illness = as.numeric(TIEMPO_EVOLUCION_TRASTORNO),
+    Age_onset        = Age - Duration_illness,
+
+    # ── Sex ───────────────────────────────────────────────────────────────────
+    # SEXO: 0=MUJER, 1=HOMBRE
+    Sex = factor(as.numeric(SEXO),
+                 levels = c(0, 1),
+                 labels = c("Female", "Male")),
+
+    # ── Comorbidity ───────────────────────────────────────────────────────────
+    # COMORBILIDADES: 0=NO, 1=SI
+    Comorbidity = factor(as.numeric(COMORBILIDADES),
+                         levels = c(0, 1),
+                         labels = c("No", "Yes")),
+
+    # ── Treatment type ────────────────────────────────────────────────────────
+    # INTERVENCION: 0=TCC, 1=FARMACO, 2=COMBINADA
+    Treatment = factor(as.numeric(INTERVENCION),
+                       levels = c(0, 1, 2),
+                       labels = c("CBT", "Medication", "CBT + Medication")),
+
+    # ── Number of medications ─────────────────────────────────────────────────
+    # NUM_FARMACOS: 0=NINGUNO, 1=UN FÀRMAC, 2=DOS FÀRMACS, 3=TRES FÀRMACS
+    N_medications = factor(as.numeric(NUM_FARMACOS),
+                           levels = c(0, 1, 2, 3),
+                           labels = c("None", "Monotherapy",
+                                      "Two", "Three")),
+
+    # ── Medication types ──────────────────────────────────────────────────────
+    # 0=ISRS, 1=APS ATIPICO, 2=MFD, 3=BDZ, 4=AGONIS ADREN,
+    # 5=ANTICONVULS, 6=EUTIMIZ, 7=ATOMOXETINA, 8=ANTIDEP CICLIC,
+    # 9=PIZOTIFENO, 10=NINGUNO
+    
+    #datos$TIPO_FARMACO1 <-na_if(datos$TIPO_FARMACO1, 999)
+
+    Med1 = factor(as.character(as.numeric(TIPO_FARMACO1)),
+                  levels = med_levels, labels = med_labels),
+    Med2 = factor(as.character(as.numeric(TIPO_FARMACO2)),
+                  levels = med_levels, labels = med_labels),
+    Med3 = factor(as.character(as.numeric(TIPO_FARMACO3)),
+                  levels = med_levels, labels = med_labels),
+
+    # ── Clinical scores ───────────────────────────────────────────────────────
+    CYBOCS      = as.numeric(CYBOCS),
+    YGTSS       = as.numeric(YGTSS),
+    ADOS        = as.numeric(ADOS),
+    CGI_current = as.numeric(CGI_ACTUAL)
+  )
+
+message("Data prepared: ", nrow(df), " subjects")
+message("\nDiagnosis distribution:")
+print(table(df$Diagnosis, useNA = "always"))
+
+```
+
+---
+
+## 2. Build medication presence variables
+
+Each medication class as a Yes/No variable — more informative
+than listing primary drug only, captures polypharmacy.
+
+```{r medications}
+
+# Names must match EXACTLY with med_labels defined in chunk 1
+all_meds <- c(
+  "SSRI",
+  "Atypical antipsychotic",
+  "Methylphenidate",
+  "Benzodiazepines",              
+  "Adrenergic agonist",
+  "Anticonvulsant (topiramate)", 
+  "Mood stabilizer",
+  "Atomoxetine",
+  "Tricyclic antidepressant",
+  "Pimozide"
+)
+
+for (med in all_meds) {
+  col_name <- paste0("Med_", gsub("[() ]", "_", med))  # handles parentheses too
+  df[[col_name]] <- factor(
+    as.integer((df$Med1 == med & !is.na(df$Med1)) | (df$Med2 == med & !is.na(df$Med2)) | (df$Med3 == med & !is.na(df$Med3)) ),
+    levels = c(0, 1), labels = c("No", "Yes")
+  )
+}
+
+med_vars <- paste0("Med_", gsub("[() ]", "_", all_meds))
+
+# Verify counts
+message("Medication variable check:")
+for (i in seq_along(all_meds)) {
+  n_yes <- sum(df[[med_vars[i]]] == "Yes", na.rm = TRUE)
+  message("  ", all_meds[i], ": ", n_yes, " subjects")
+}
+
+```
+
+---
+
+## 3. Descriptive table
+
+```{r table1}
+
+# Force ADOS and CGI to numeric explicitly before table
+# (avoids gtsummary treating them as categorical if they have few unique values)
+df <- df %>%
+  mutate(
+    ADOS        = as.double(ADOS),
+    CGI_current = as.double(CGI_current),
+    CYBOCS      = as.double(CYBOCS),
+    YGTSS       = as.double(YGTSS)
+  )
+
+vars_table <- c(
+  "Age", "Sex", "Age_onset",
+  "Comorbidity",
+  "Treatment",
+  "N_medications",
+  med_vars,
+  "CYBOCS", "YGTSS", "ADOS",
+  "CGI_current"
+)
+
+# Build dynamic label list for medication vars
+med_label_list <- setNames(
+  as.list(all_meds),
+  med_vars
+)
+
+# Fixed labels
+fixed_labels <- list(
+  Age              ~ "Age, years",
+  Sex              ~ "Sex",
+  Age_onset        ~ "Age of onset",
+  Comorbidity      ~ "Presence of comorbidity",
+  Treatment        ~ "Type of treatment",
+  N_medications    ~ "Number of medications",
+  CYBOCS           ~ "CY-BOCS score",
+  YGTSS            ~ "YGTSS score",
+  ADOS             ~ "ADOS score",
+  CGI_current      ~ "CGI severity (current)"
+)
+
+all_labels <- c(fixed_labels, med_label_list)
+
+tbl <- df %>%
+  dplyr::select(Diagnosis, all_of(vars_table)) %>%
+  tbl_summary(
+    by        = Diagnosis,
+    statistic = list(
+      # All continuous as mean (SD) — including ADOS and CGI explicitly
+      all_continuous()  ~ "{mean} ({sd})",
+      all_categorical() ~ "{n} ({p}%)"
+    ),
+    type = list(
+      # Force these to continuous regardless of number of unique values
+      ADOS        ~ "continuous",
+      CGI_current ~ "continuous",
+      CYBOCS      ~ "continuous",
+      YGTSS       ~ "continuous",
+      med_vars    ~ "dichotomous"
+    ),
+    digits = list(
+      all_continuous()  ~ 1,
+      all_categorical() ~ c(0, 1)
+    ),
+    label        = all_labels,
+    missing      = "no",
+    missing_text = "—"
+  ) %>%
+ #show_single_row = med_vars %>%
+  add_overall(
+    last      = FALSE,
+    col_label = "**Total**\nN = {N}"
+  ) %>%
+  add_p(
+    test = list(
+      all_continuous()  ~ "kruskal.test",
+      all_categorical() ~ "chisq.test"
+    ),
+    pvalue_fun = function(x) style_pvalue(x, digits = 3)
+  ) %>%
+  add_significance_stars(
+    hide_ci = TRUE,
+    hide_p  = FALSE,
+    pattern = "{p.value}{stars}"
+  ) %>%
+  #bold_labels() %>%
+  # Indent medication subvariables
+  modify_table_styling(
+    columns     = label,
+    rows        = variable %in% med_vars,
+    text_format = "indent"
+  ) %>%
+  # Add "Medication type" header row for drug subvariables
+  # and remove bold from those rows (subcategories in normal weight)
+  modify_table_body(
+    ~ .x %>%
+      mutate(
+        groupname_col = case_when(
+          variable %in% med_vars ~ "Medication type, n (%)",
+          TRUE                   ~ NA_character_
+        )
+      )
+  ) %>%
+  modify_header(
+    label   ~ "**Variable**",
+    stat_0  ~ "**Total**\nN = {N}",
+    stat_1  ~ "**OCD**\nn = {n}",
+    stat_2  ~ "**Tourette**\nn = {n}",
+    stat_3  ~ "**ASD**\nn = {n}",
+    p.value ~ "**p-value**"
+  ) %>%
+  modify_caption(
+    "**Table 1. Demographic and clinical characteristics by diagnosis**"
+  ) %>%
+  modify_footnote(
+    p.value ~ paste0(
+      "Kruskal-Wallis test for continuous variables; ",
+      "Chi-square test for categorical variables ",
+      "(Fisher's exact test applied automatically when expected cell count < 5). ",
+      "* p<0.05, ** p<0.01, *** p<0.001. ",
+      "CY-BOCS score reported for OCD patients only; ",
+      "YGTSS for Tourette patients only; ",
+      "ADOS for ASD patients only."
+    )
+  )
+
+tbl
+
+```
+
+---
+
+## 4. Export
+
+```{r export}
+
+# Word document
+tbl %>%
+  as_gt() %>%
+  gt::gtsave(filename = file.path(out_dir, "Table1_Descriptive.docx"))
+
+# HTML preview
+tbl %>%
+  as_gt() %>%
+  gt::gtsave(filename = file.path(out_dir, "Table1_Descriptive.html"))
+
+message("Tables saved to: ", out_dir)
+
+```
+
+---
+
+## 5. Missing values check
+
+```{r missing}
+
+df %>%
+  dplyr::select(Diagnosis, all_of(vars_table)) %>%
+  summarise(across(everything(), ~ sum(is.na(.)))) %>%
+  pivot_longer(everything(),
+               names_to  = "variable",
+               values_to = "n_missing") %>%
+  filter(n_missing > 0) %>%
+  arrange(desc(n_missing)) %>%
+  print()
+
+```
+
+```{r}
+com_levels <- c(0,1, 2,3, 4, 5, 6, 7, 8, 9)
+
+com_labels <- c("OCD", "TS", "ASD", "Anxiety disorder", "ADHD", "Psychotic disorder", "Depressive disorder", "ODD", "Learning disorder",  "Motor tic disorder")
+
+diag_vars <- c("DIAGNOSTICO2", "DIAGNOSTICO3", "DIAGNOSTICO4")
+
+for(i in seq_along(com_levels)) {
+
+  code <- com_levels[i]
+  label <- com_labels[i]
+
+  col_name <- paste0("Com_", make.names(label))
+
+  df[[col_name]] <- factor(
+    as.integer(
+      rowSums(
+        sapply(diag_vars, function(x)
+          as.numeric(df_raw[[x]]) == code),
+        na.rm = TRUE
+      ) > 0
+    ),
+    levels = c(0, 1),
+    labels = c("No", "Yes")
+  )
+}
+
+com_vars <- paste0("Com_", make.names(com_labels))
+
+tbl_comorb <- df %>%
+  select(Diagnosis, all_of(com_vars)) %>%
+  tbl_summary(
+    by = Diagnosis,
+    statistic = all_categorical() ~ "{n} ({p}%)",
+    label = list(
+      Com_OCD                 ~ "OCD",
+      Com_TS                  ~ "TS",
+      Com_ASD                 ~ "ASD",
+      Com_Anxiety.disorder    ~ "Anxiety disorder",
+      Com_ADHD                ~ "ADHD",
+      Com_Psychotic.disorder  ~ "Psychotic disorder",
+      Com_Depressive.disorder ~ "Depressive disorder",
+      Com_ODD                 ~ "ODD",
+      Com_Learning.disorder   ~ "Learning disorder",
+      Com_Motor.tic.disorder  ~ "Motor tic disorder"
+    ),
+    missing = "no"
+  ) %>%
+  add_overall() %>%
+  add_p()
+
+tbl_comorb
+```
+```{r}
+
+# Word document
+tbl_comorb %>%
+  as_gt() %>%
+  gt::gtsave(filename = file.path(out_dir, "Table_Descriptive_Comorbidities.docx"))
+
+# HTML preview
+tbl_comorb %>%
+  as_gt() %>%
+  gt::gtsave(filename = file.path(out_dir, "Table2_Descriptive_COmorbidities.html"))
+
+message("Tables saved to: ", out_dir)
+
+```
+
+
+

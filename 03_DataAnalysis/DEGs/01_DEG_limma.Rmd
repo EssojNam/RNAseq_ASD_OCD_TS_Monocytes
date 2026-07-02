@@ -1,0 +1,752 @@
+---
+title: "01_Limma"
+output: html_document
+date: "2026-03-25"
+---
+
+## 0. Configuration directories and libraries
+
+Include all necessary libraries and paths to the corresponding files
+
+
+```{r setup}
+
+library(edgeR)
+library(limma)
+library(ggplot2)
+library(dplyr)
+library(tibble)
+library(tidyr)
+library(RColorBrewer)
+library(pheatmap)
+library(ggVennDiagram)
+
+in_dir   <- "/home/jose/Desktop/RNAseq/results/counts/bulk/"
+diagnosis_dir <- "/home/jose/Desktop/RNAseq/data/Diagnosis_data"
+out_dir  <- "/home/jose/Desktop/RNAseq/results/DEG/voom"
+plot_dir <- "/home/jose/Desktop/RNAseq/results/plots/voom_v2"
+dir.create(out_dir,  recursive = TRUE, showWarnings = FALSE)
+dir.create(plot_dir, recursive = TRUE, showWarnings = FALSE)
+
+in_counts   <- file.path(in_dir, "rawcounts_ComBatSeq.csv")
+in_metadata <- file.path(diagnosis_dir, "Mostres_RNAseqJose.csv")
+
+```
+
+## 1. Thresholds
+
+```{r thresholds}
+FDR <- 0.05
+FC <- 1
+```
+
+## 2. Load counts
+
+```{r loading counts}
+
+counts_df <- read.csv(in_counts, header = TRUE, stringsAsFactors = FALSE, check.names = FALSE)
+colnames(counts_df)[1] <- "Gene"
+counts_df[, -1] <- lapply(counts_df[, -1, drop = FALSE], as.numeric)
+
+counts <- as.matrix(counts_df[, -1, drop = FALSE])
+rownames(counts) <- counts_df$Gene
+counts <- round(counts)
+
+message("Counts loaded: ", nrow(counts), " genes x ", ncol(counts), " samples")
+
+```
+
+## 3. Build coldata
+
+```{r coldata}
+
+sample_names <- colnames(counts)
+
+batch     <- ifelse(grepl("_FC1_", sample_names, ignore.case = TRUE), "FC1",
+             ifelse(grepl("_FC2_", sample_names, ignore.case = TRUE), "FC2", "FC3"))
+treatment <- ifelse(grepl("basal", sample_names, ignore.case = TRUE), "Basal", "LPS")
+donor_id  <- sub("^[^_]+_[^_]+_([^_]+)_.*", "\\1", sample_names)
+donor_id  <- gsub("\\.?LPS$", "", donor_id)
+
+coldata <- data.frame(
+  sample    = sample_names,
+  treatment = factor(treatment, levels = c("Basal", "LPS")),
+  batch     = factor(batch),
+  donor_id  = factor(donor_id),
+  stringsAsFactors = FALSE
+)
+rownames(coldata) <- sample_names
+
+# Merge Diagnosis
+meta_df       <- read.csv(in_metadata, header = TRUE, stringsAsFactors = FALSE, check.names = FALSE)
+meta_id_col   <- "Sample_ID"   
+meta_diag_col <- "Diagnosis"   
+
+coldata$diagnosis <- meta_df[[meta_diag_col]][match(coldata$donor_id, meta_df[[meta_id_col]])]
+coldata$diagnosis <- sub("\\+.*", "", coldata$diagnosis)  # keep first diagnosis
+
+# Check all samples present a diagnosis
+na_idx <- which(is.na(coldata$diagnosis))
+if (length(na_idx) > 0) {
+  stop("Missing diagnosis in samples:\n",
+       paste(rownames(coldata)[na_idx], collapse = ", "))
+} else {
+  message("Diagnosis assigned to all samples successfully.")
+}
+
+# In case of lack of diagnosis may apply: "coldata$diagnosis[c(135,136,137,326,327,328)] <- "Tourette""
+
+coldata$diagnosis <- factor(coldata$diagnosis)
+message("Samples per group:")
+print(table(coldata$treatment, coldata$diagnosis))
+
+
+```
+
+## 4. Gene Filtering + TMM normalization
+
+This step is made to filter genes that present few counts, that are not statistically quantifiable
+
+```{r filter}
+
+dge  <- DGEList(counts = counts, group = coldata$treatment)
+keep <- filterByExpr(dge, group = coldata$treatment)
+dge  <- dge[keep, , keep.lib.sizes = FALSE]
+dge  <- calcNormFactors(dge, method = "TMM")
+message("Genes after filtering: ", sum(keep), " / ", length(keep))
+
+```
+
+## 5. Plots gene regulation
+
+```{r plots}
+
+save_deg_results <- function(fit2, coef_name, name) {
+
+  res_df <- topTable(fit2, coef = coef_name, number = Inf, sort.by = "P") %>%
+    rownames_to_column("gene") %>%
+    dplyr::rename(log2FoldChange = logFC, padj = adj.P.Val, pvalue = P.Value, baseMean = AveExpr)
+
+  res_df$status <- "NS"
+  res_df$status[res_df$padj < FDR & res_df$log2FoldChange >  FC] <- "Up"
+  res_df$status[res_df$padj < FDR & res_df$log2FoldChange < -FC] <- "Down"
+  res_df$status <- factor(res_df$status, levels = c("Up", "Down", "NS"))
+
+  n_up   <- sum(res_df$status == "Up",   na.rm = TRUE)
+  n_down <- sum(res_df$status == "Down", na.rm = TRUE)
+  message(name, " — Up: ", n_up, "  Down: ", n_down)
+
+  write.csv(res_df, file = file.path(out_dir, paste0(name, "_results.csv")), row.names = FALSE)
+
+  res_filt <- res_df %>% filter(!is.na(padj))
+
+  # Volcano
+  p_vol <- ggplot(res_filt, aes(x = log2FoldChange, y = -log10(padj), color = status)) +
+    geom_point(size = 1.2, alpha = 0.6) +
+    scale_color_manual(values = c("Up"="#ee2c2c","Down"="#00008b","NS"="grey70")) +
+    geom_vline(xintercept = c(-FC, FC), linetype="dashed", color="grey40") +
+    geom_hline(yintercept = -log10(FDR),    linetype="dashed", color="grey40") +
+    annotate("text", x =  max(res_filt$log2FoldChange)*0.8,
+             y = max(-log10(res_filt$padj))*0.95,
+             label = paste0("Up: ", n_up),   color="#ee2c2c", size=4) +
+    annotate("text", x =  min(res_filt$log2FoldChange)*0.8,
+             y = max(-log10(res_filt$padj))*0.95,
+             label = paste0("Down: ", n_down), color="#00008b", size=4) +
+    labs(title    = paste("Volcano —", name),
+         subtitle = paste0("FDR < ", FDR, "  |  |log2FC| > ", FC),
+         x = "log2 Fold Change", y = "-log10(FDR)") +
+    theme_bw(base_size = 13) +
+    theme(plot.title = element_text(face="bold"), legend.title = element_blank())
+
+  ggsave(file.path(plot_dir, paste0(name, "_volcano.png")),
+         p_vol, width=7, height=6, dpi=300)
+
+  # MA plot
+  p_ma <- ggplot(res_filt, aes(x = log2(baseMean+1), y = log2FoldChange, color = status)) +
+    geom_point(size=1, alpha=0.5) +
+    scale_color_manual(values = c("Up"="#ee2c2c","Down"="#00008b","NS"="grey70")) +
+    geom_hline(yintercept = c(-FC, 0, FC),
+               linetype=c("dashed","solid","dashed"), color="grey40") +
+    labs(title    = paste("MA plot —", name),
+         subtitle = paste0("FDR < ", FDR, "  |  |log2FC| > ", FC),
+         x = "log2(mean expression)", y = "log2 Fold Change") +
+    theme_bw(base_size=13) +
+    theme(plot.title=element_text(face="bold"), legend.title=element_blank())
+
+  ggsave(file.path(plot_dir, paste0(name, "_MA.png")),
+         p_ma, width=7, height=6, dpi=300)
+
+  invisible(res_df)
+}
+
+save_ftest_results <- function(fit2, name) {
+
+  res_df <- topTable(fit2, number = Inf, sort.by = "F") %>%
+    rownames_to_column("gene")
+
+  # Filtrar NA en adj.P.Val antes de contar significativos
+  res_filt <- res_df %>% filter(!is.na(adj.P.Val))
+  n_sig <- sum(res_filt$adj.P.Val < FDR)
+  message(name, " — Significant genes (FDR < ", FDR, "): ", n_sig)
+
+  write.csv(res_df,
+            file = file.path(out_dir, paste0(name, "_results.csv")),
+            row.names = FALSE)
+
+  # F-statistic plot
+  p_f <- ggplot(res_filt, aes(x = AveExpr, y = F, color = adj.P.Val < FDR)) +
+    geom_point(size=1, alpha=0.5) +
+    scale_color_manual(values = c("TRUE"="#ee2c2c","FALSE"="grey70"),
+                       labels = c("TRUE"=paste0("FDR < ",FDR),"FALSE"="NS")) +
+    labs(title = paste("F-statistic —", name),
+         subtitle = paste0("Significant genes: ", n_sig),
+         x = "Average expression (logCPM)", y = "F-statistic", color="") +
+    theme_bw(base_size=13) +
+    theme(plot.title=element_text(face="bold"))
+
+  ggsave(file.path(plot_dir, paste0(name, "_Fstat.png")),
+         p_f, width=7, height=6, dpi=300)
+
+  invisible(res_filt)
+}
+```
+
+## 6. Treatment global model 
+
+~ donor_id + treatment 
+Comparisons LPS vs Basal in global
+
+```{r treatment}
+
+## 6. Treatment global model 
+
+# Create group (same as before)
+coldata$group <- factor(paste(coldata$diagnosis, coldata$treatment, sep="_"))
+
+# NEW DESIGN (no donor_id here)
+design1 <- model.matrix(~ 0 + group, data = coldata)
+colnames(design1) <- gsub("group", "", colnames(design1))
+colnames(design1) <- make.names(colnames(design1))
+message("Model 1 columns:"); print(colnames(design1))
+
+# voom
+png(file.path(plot_dir, "M1_limma_trend.png"), width=7, height=6, units="in", res=300)
+v1 <- voom(dge, design1, plot=TRUE)
+dev.off()
+message("Model 1 voom trend saved.")
+
+# Estimate within-donor correlation
+corfit <- duplicateCorrelation(v1, design1, block = coldata$donor_id)
+
+# Fit model with blocking
+fit1 <- lmFit(v1, design1, block = coldata$donor_id, correlation = corfit$consensus)
+
+## A. LPS vs Basal — global ---------------------------------------------------
+message("\n--- Comparison A: LPS vs Basal (global) ---")
+cm_A <- makeContrasts(
+  LPS_vs_Basal = (TEA_LPS + TOC_LPS + Tourette_LPS) / 3 -
+                 (TEA_Basal + TOC_Basal + Tourette_Basal) / 3,
+  levels = design1
+)
+fit1_A <- contrasts.fit(fit1, cm_A)
+fit1_A <- eBayes(fit1_A)
+save_deg_results(fit1_A, "LPS_vs_Basal", "M1_LPS_vs_Basal_global")
+
+## A2. LPS vs Basal — TEA only ------------------------------------------------
+message("\n--- Comparison A2: LPS vs Basal (TEA only) ---")
+cm_A2 <- makeContrasts(TEA_LPS - TEA_Basal, levels = design1)
+fit1_A2 <- contrasts.fit(fit1, cm_A2)
+fit1_A2 <- eBayes(fit1_A2)
+save_deg_results(fit1_A2, "TEA_LPS - TEA_Basal", "M2.1_LPS_vs_Basal_TEA")
+
+## A3. LPS vs Basal — TOC only ------------------------------------------------
+message("\n--- Comparison A3: LPS vs Basal (TOC only) ---")
+cm_A3 <- makeContrasts(TOC_LPS - TOC_Basal, levels = design1)
+fit1_A3 <- contrasts.fit(fit1, cm_A3)
+fit1_A3 <- eBayes(fit1_A3)
+save_deg_results(fit1_A3, "TOC_LPS - TOC_Basal", "M2.2_LPS_vs_Basal_TOC")
+
+## A4. LPS vs Basal — Tourette only -------------------------------------------
+message("\n--- Comparison A4: LPS vs Basal (Tourette only) ---")
+cm_A4 <- makeContrasts(Tourette_LPS - Tourette_Basal, levels = design1)
+fit1_A4 <- contrasts.fit(fit1, cm_A4)
+fit1_A4 <- eBayes(fit1_A4)
+save_deg_results(fit1_A4, "Tourette_LPS - Tourette_Basal", "M2.3_LPS_vs_Basal_Tourette")
+
+## C. Interaction F-test ------------------------------------------------------
+message("\n--- Comparison C: Interaction LPS x Diagnosis ---")
+cm_C <- makeContrasts(
+  Int_TEA_vs_TOC      = (TEA_LPS - TEA_Basal) - (TOC_LPS - TOC_Basal),
+  Int_TEA_vs_Tourette = (TEA_LPS - TEA_Basal) - (Tourette_LPS - Tourette_Basal),
+  levels = design1
+)
+fit1_C <- contrasts.fit(fit1, cm_C)
+fit1_C <- eBayes(fit1_C)
+save_ftest_results(fit1_C, "M1_Interaction_LPS_x_Diagnosis")
+
+```
+
+## 8. Diagnosis differences Basal
+
+~ diagnosis in Basal subset
+Comparisons global + pairwise (ASD-OCD, ASD-TS, OCD-TS) without LPS noise
+
+```{r diagnosis}
+
+idx_basal     <- coldata$treatment == "Basal"
+counts_basal  <- counts[keep, idx_basal]
+coldata_basal <- coldata[idx_basal, ]
+coldata_basal$diagnosis <- droplevels(coldata_basal$diagnosis)
+
+dge2    <- DGEList(counts = counts_basal, group = coldata_basal$diagnosis)
+dge2    <- calcNormFactors(dge2, method = "TMM")
+design2 <- model.matrix(~ 0 + diagnosis, data = coldata_basal)
+colnames(design2) <- levels(coldata_basal$diagnosis)
+
+png(file.path(plot_dir, "M3_limma_trend_Basal.png"),
+    width=7, height=6, units="in", res=300)
+v2 <- voom(dge2, design2, plot=TRUE)
+dev.off()
+message("Model 3 voom trend saved.")
+
+fit2 <- lmFit(v2, design2)
+
+# ASD vs OCD
+
+fit2_Bx1 <- contrasts.fit(fit2, makeContrasts(TEA - TOC, levels=design2))
+fit2_Bx1 <- eBayes(fit2_Bx1)
+save_deg_results(fit2_Bx1, "TEA - TOC", "M3.1_Basal_TEA_vs_TOC")
+
+# ASD vs TS
+
+fit2_Bx2 <- contrasts.fit(fit2, makeContrasts(TEA - Tourette, levels=design2))
+fit2_Bx2 <- eBayes(fit2_Bx2)
+save_deg_results(fit2_Bx2, "TEA - Tourette", "M3.2_Basal_TEA_vs_Tourette")
+
+# OCD vs TS
+
+fit2_Bx3 <- contrasts.fit(fit2, makeContrasts(TOC - Tourette, levels=design2))
+fit2_Bx3 <- eBayes(fit2_Bx3)
+save_deg_results(fit2_Bx3, "TOC - Tourette", "M3.3_Basal_TOC_vs_Tourette")
+
+# Global F-test
+
+fit_basal <- contrasts.fit(fit2, makeContrasts(TEA_vs_TOC  = TEA - TOC, TEA_vs_Tourette = TEA - Tourette, TOC_vs_Tourette = TOC - Tourette,  levels = design2))
+fit_basal <- eBayes(fit_basal)
+res_anova_basal <- save_ftest_results(fit_basal, "M3_ANOVA_Basal_global")
+
+```
+
+## 9. Diagnosis differences LPS
+
+~ diagnosis in LPS subset
+Comparisons global + pairwise (ASD-OCD, ASD-TS, OCD-TS)
+
+```{r diagnosis}
+
+idx_lps     <- coldata$treatment == "LPS"
+counts_lps  <- counts[keep, idx_lps]
+coldata_lps <- coldata[idx_lps, ]
+coldata_lps$diagnosis <- droplevels(coldata_lps$diagnosis)
+
+dge3    <- DGEList(counts = counts_lps, group = coldata_lps$diagnosis)
+dge3    <- calcNormFactors(dge3, method = "TMM")
+design3 <- model.matrix(~ 0 + diagnosis, data = coldata_lps)
+colnames(design3) <- levels(coldata_lps$diagnosis)
+
+png(file.path(plot_dir, "M4_voom_trend_LPS.png"),
+    width=7, height=6, units="in", res=300)
+v3 <- voom(dge3, design3, plot=TRUE)
+dev.off()
+message("Model 4 voom trend saved.")
+
+fit3 <- lmFit(v3, design3)
+
+# ASD vs OCD
+
+fit3_Lx1 <- contrasts.fit(fit3, makeContrasts(TEA - TOC, levels=design3))
+fit3_Lx1 <- eBayes(fit3_Lx1)
+save_deg_results(fit3_Lx1, "TEA - TOC", "M4.1_LPS_TEA_vs_TOC")
+
+# ASD vs TS
+
+fit3_Lx2 <- contrasts.fit(fit3, makeContrasts(TEA - Tourette, levels=design3))
+fit3_Lx2 <- eBayes(fit3_Lx2)
+save_deg_results(fit3_Lx2, "TEA - Tourette", "M4.2_LPS_TEA_vs_Tourette")
+
+# OCD vs TS
+
+fit3_Lx3 <- contrasts.fit(fit3, makeContrasts(TOC - Tourette, levels=design3))
+fit3_Lx3 <- eBayes(fit3_Lx3)
+save_deg_results(fit3_Lx3, "TOC - Tourette", "M4.3_LPS_TOC_vs_Tourette")
+
+# Global F-test
+fit_lps <- contrasts.fit(fit3, makeContrasts(TEA_vs_TOC  = TEA - TOC, TEA_vs_Tourette = TEA - Tourette, TOC_vs_Tourette = TOC - Tourette,  levels = design3))
+fit_lps <- eBayes(fit_lps)
+res_anova_lps <- save_ftest_results(fit_lps, "M4_ANOVA_LPS_global")
+
+```
+
+
+## 10. Comparison LPS change between samples
+
+logFC (Basal -> LPS) per donor
+
+```{r donor-LPS}
+
+## 10. Comparison LPS response between diagnoses (per-donor LFC + limma)
+
+# --- 10.1 logCPM and per-donor LFC matrix ---
+
+logcpm <- cpm(dge, log = TRUE, prior.count = 1)   # dge is already TMM-normalized from chunk 4
+
+lfc_list <- lapply(levels(coldata$donor_id), function(d) {
+  meta_d <- coldata[coldata$donor_id == d, ]
+  
+  # Find batches that have both Basal and LPS for this donor
+  batches_with_both <- intersect(
+    as.character(meta_d$batch[meta_d$treatment == "Basal"]),
+    as.character(meta_d$batch[meta_d$treatment == "LPS"])
+  )
+  if (length(batches_with_both) == 0) return(NULL)
+  
+  # Compute LFC per batch (paired Basal→LPS), then average across batches
+  lfc_per_batch <- sapply(batches_with_both, function(b) {
+    s_basal <- rownames(meta_d)[meta_d$treatment == "Basal" & meta_d$batch == b]
+    s_lps   <- rownames(meta_d)[meta_d$treatment == "LPS"   & meta_d$batch == b]
+    logcpm[, s_lps] - logcpm[, s_basal]
+  })
+  
+  if (is.matrix(lfc_per_batch)) rowMeans(lfc_per_batch) else lfc_per_batch
+})
+
+names(lfc_list) <- levels(coldata$donor_id)
+lfc_list        <- lfc_list[!sapply(lfc_list, is.null)]
+lfc_matrix      <- do.call(cbind, lfc_list)
+
+# --- 10.2 Build donor-level coldata ---
+
+surviving_donors <- colnames(lfc_matrix)
+
+coldata_donor <- coldata %>%
+  filter(as.character(donor_id) %in% surviving_donors) %>%
+  distinct(donor_id, .keep_all = TRUE) %>%
+  arrange(match(as.character(donor_id), surviving_donors))
+
+rownames(coldata_donor) <- as.character(coldata_donor$donor_id)
+coldata_donor$diagnosis <- droplevels(coldata_donor$diagnosis)
+
+# Sanity checks
+message("Per-donor LFC matrix: ", nrow(lfc_matrix), " genes x ", ncol(lfc_matrix), " donors")
+stopifnot(all(colnames(lfc_matrix) == rownames(coldata_donor)))
+print(table(coldata_donor$diagnosis))
+
+# --- 10.3 limma: diagnosis differences in LPS response ---
+
+design_lfc <- model.matrix(~ 0 + diagnosis, data = coldata_donor)
+colnames(design_lfc) <- levels(coldata_donor$diagnosis)
+
+fit_lfc  <- lmFit(lfc_matrix, design_lfc)
+cm_lfc   <- makeContrasts(
+  D1_TEA_vs_TOC      = TEA - TOC,
+  D2_TEA_vs_Tourette = TEA - Tourette,
+  D3_TOC_vs_Tourette = TOC - Tourette,
+  levels = design_lfc
+)
+fit_lfc2 <- contrasts.fit(fit_lfc, cm_lfc)
+fit_lfc2 <- eBayes(fit_lfc2)
+
+# --- 10.4 Save results and plots per contrast ---
+
+for (ct in colnames(cm_lfc)) {
+  
+  res_lfc <- topTable(fit_lfc2, coef = ct, number = Inf, sort.by = "P") %>%
+    rownames_to_column("gene") %>%
+    rename(
+      log2FoldChange = logFC,
+      padj           = adj.P.Val,
+      pvalue         = P.Value,
+      baseMean       = AveExpr
+    )
+  
+  res_lfc$status <- "NS"
+  res_lfc$status[res_lfc$padj < FDR & res_lfc$log2FoldChange >  FC] <- "Up"
+  res_lfc$status[res_lfc$padj < FDR & res_lfc$log2FoldChange < -FC] <- "Down"
+  res_lfc$status <- factor(res_lfc$status, levels = c("Up", "Down", "NS"))
+  
+  n_up   <- sum(res_lfc$status == "Up")
+  n_down <- sum(res_lfc$status == "Down")
+  message(ct, " — Up: ", n_up, "  Down: ", n_down)
+  
+  write.csv(res_lfc,
+            file      = file.path(out_dir, paste0(ct, "_results.csv")),
+            row.names = FALSE)
+  
+  res_filt <- res_lfc %>% filter(!is.na(padj))
+  
+  # Volcano
+  p_vol <- ggplot(res_filt, aes(x = log2FoldChange, y = -log10(padj), color = status)) +
+    geom_point(size = 1.2, alpha = 0.6) +
+    scale_color_manual(values = c("Up" = "#e05c5c", "Down" = "#4e9af1", "NS" = "grey70")) +
+    geom_vline(xintercept = c(-FC, FC), linetype = "dashed", color = "grey40") +
+    geom_hline(yintercept = -log10(FDR), linetype = "dashed", color = "grey40") +
+    annotate("text", x =  max(res_filt$log2FoldChange) * 0.8,
+             y = max(-log10(res_filt$padj)) * 0.95,
+             label = paste0("Up: ", n_up),   color = "#e05c5c", size = 4) +
+    annotate("text", x =  min(res_filt$log2FoldChange) * 0.8,
+             y = max(-log10(res_filt$padj)) * 0.95,
+             label = paste0("Down: ", n_down), color = "#4e9af1", size = 4) +
+    labs(title    = paste("Volcano —", ct),
+         subtitle = paste0("FDR < ", FDR, "  |  |log2FC| > ", FC),
+         x = "log2 Fold Change", y = "-log10(FDR)") +
+    theme_bw(base_size = 13) +
+    theme(plot.title = element_text(face = "bold"), legend.title = element_blank())
+  
+  ggsave(file.path(plot_dir, paste0(ct, "_volcano.png")),
+         p_vol, width = 7, height = 6, dpi = 300)
+  
+  # MA plot
+  p_ma <- ggplot(res_filt, aes(x = baseMean, y = log2FoldChange, color = status)) +
+    geom_point(size = 1, alpha = 0.5) +
+    scale_color_manual(values = c("Up" = "#e05c5c", "Down" = "#4e9af1", "NS" = "grey70")) +
+    geom_hline(yintercept = c(-FC, 0, FC),
+               linetype = c("dashed", "solid", "dashed"), color = "grey40") +
+    labs(title    = paste("MA plot —", ct),
+         subtitle = paste0("FDR < ", FDR, "  |  |log2FC| > ", FC),
+         x = "Average logFC (across donors)", y = "log2 Fold Change") +
+    theme_bw(base_size = 13) +
+    theme(plot.title = element_text(face = "bold"), legend.title = element_blank())
+  
+  ggsave(file.path(plot_dir, paste0(ct, "_MA.png")),
+         p_ma, width = 7, height = 6, dpi = 300)
+}
+```
+
+```{r}
+
+# Step 4: Global F-test ANOVA (all three contrasts simultaneously)
+anova_res <- topTable(fit_lfc2, number = Inf, sort.by = "F") %>%
+  rownames_to_column("gene") %>%
+  rename(pvalue = P.Value, padj = adj.P.Val) %>%
+  mutate(status = ifelse(!is.na(padj) & padj < FDR, "Significant", "NS"))
+
+write.csv(anova_res,
+          file = file.path(out_dir, "M5_LFC_ANOVA_global_results.csv"),
+          row.names = FALSE)
+message("Genes with significant differential LPS response (ANOVA): ",
+        sum(anova_res$status == "Significant", na.rm = TRUE))
+
+# Step 5: Mean ΔlogFC per diagnosis (descriptive summary)
+lfc_summary <- data.frame(
+  gene             = rownames(lfc_matrix),
+  TEA_meanLFC      = rowMeans(lfc_matrix[, coldata_donor$diagnosis == "TEA",      drop = FALSE]),
+  TOC_meanLFC      = rowMeans(lfc_matrix[, coldata_donor$diagnosis == "TOC",      drop = FALSE]),
+  Tourette_meanLFC = rowMeans(lfc_matrix[, coldata_donor$diagnosis == "Tourette", drop = FALSE])
+)
+
+anova_full <- merge(anova_res, lfc_summary, by = "gene") %>% arrange(padj)
+
+write.csv(anova_full,
+          file = file.path(out_dir, "M5_LFC_ANOVA_with_summary_results.csv"),
+          row.names = FALSE)
+message("Full ANOVA + summary table saved.")
+
+# Step 6: Pairwise contrasts
+for (ct in colnames(cm_lfc)) {
+  res_lfc <- topTable(fit_lfc2, coef = ct, number = Inf, sort.by = "P") %>%
+    rownames_to_column("gene") %>%
+    rename(log2FoldChange = logFC,
+           padj           = adj.P.Val,
+           pvalue         = P.Value,
+           baseMean       = AveExpr)
+  save_lfc_contrast(res_lfc, paste0("M5_LFC_response_", ct))
+}
+
+```
+
+
+# 11. Integration ANOVA results
+
+```{r}
+# Extract significant gene sets from each ANOVA
+sig_basal <- res_anova_basal$gene[!is.na(res_anova_basal$padj) & res_anova_basal$padj < FDR]
+sig_lps   <- res_anova_lps$gene[ !is.na(res_anova_lps$padj)   & res_anova_lps$padj   < FDR]
+sig_lfc   <- anova_res$gene[     !is.na(anova_res$padj)        & anova_res$padj        < FDR]
+
+# Set-logic categories
+only_basal    <- setdiff(sig_basal, union(sig_lps, sig_lfc))
+only_lps      <- setdiff(sig_lps,   union(sig_basal, sig_lfc))
+only_lfc      <- setdiff(sig_lfc,   union(sig_basal, sig_lps))
+basal_and_lps <- intersect(sig_basal, sig_lps)
+basal_and_lfc <- intersect(sig_basal, sig_lfc)
+lps_and_lfc   <- intersect(sig_lps,   sig_lfc)
+all_three     <- intersect(basal_and_lps, sig_lfc)
+same_fc       <- setdiff(basal_and_lps, sig_lfc)   # key category — see caveat above
+
+message("=== ANOVA Integration Summary ===")
+message("Only Basal:                            ", length(only_basal))
+message("Only LPS:                              ", length(only_lps))
+message("Only LFC (M5):                         ", length(only_lfc))
+message("Basal AND LPS — same LFC (key):        ", length(same_fc))
+message("Basal AND LPS — different LFC:         ", length(all_three))
+message("All three ANOVAs:                      ", length(all_three))
+
+# Build per-gene integration table
+all_genes <- union(union(sig_basal, sig_lps), sig_lfc)
+
+integration_df <- data.frame(
+  gene      = all_genes,
+  sig_basal = all_genes %in% sig_basal,
+  sig_lps   = all_genes %in% sig_lps,
+  sig_lfc   = all_genes %in% sig_lfc,
+  stringsAsFactors = FALSE
+) %>%
+  mutate(
+    category = case_when(
+      sig_basal & sig_lps & sig_lfc   ~ "All_three",
+      sig_basal & sig_lps & !sig_lfc  ~ "Basal_and_LPS_same_FC",
+      sig_basal & !sig_lps & sig_lfc  ~ "Basal_and_LFC",
+      !sig_basal & sig_lps & sig_lfc  ~ "LPS_and_LFC",
+      sig_basal & !sig_lps & !sig_lfc ~ "Only_Basal",
+      !sig_basal & sig_lps & !sig_lfc ~ "Only_LPS",
+      !sig_basal & !sig_lps & sig_lfc ~ "Only_LFC"
+    )
+  ) %>%
+  left_join(lfc_summary, by = "gene") %>%
+  arrange(category)
+
+write.csv(integration_df,
+          file = file.path(out_dir, "M6_ANOVA_integration.csv"),
+          row.names = FALSE)
+message("Integration table saved.")
+message("\nCategory counts:")
+print(table(integration_df$category))
+
+# --- Bar plot ---
+cat_counts <- as.data.frame(table(integration_df$category)) %>%
+  rename(category = Var1, n_genes = Freq) %>%
+  arrange(desc(n_genes))
+
+p_cat <- ggplot(cat_counts, aes(x = reorder(category, -n_genes),
+                                 y = n_genes, fill = category)) +
+  geom_bar(stat = "identity", alpha = 0.85) +
+  geom_text(aes(label = n_genes), vjust = -0.4, size = 4) +
+  scale_fill_brewer(palette = "Set2") +
+  labs(title    = "ANOVA Integration — Gene categories",
+       subtitle = "Overlap across Basal, LPS, and LFC ANOVAs (limma F-test)",
+       x = "", y = "Number of genes") +
+  theme_bw(base_size = 13) +
+  theme(plot.title      = element_text(face = "bold"),
+        axis.text.x     = element_text(angle = 35, hjust = 1),
+        legend.position = "none")
+
+ggsave(file.path(plot_dir, "M6_ANOVA_integration_barplot.png"),
+       p_cat, width = 8, height = 6, dpi = 300)
+message("Integration barplot saved.")
+
+# --- Venn diagram ---
+venn_list <- list(
+  "Basal ANOVA" = sig_basal,
+  "LPS ANOVA"   = sig_lps,
+  "LFC ANOVA"   = sig_lfc
+)
+
+p_venn <- ggVennDiagram(venn_list, label_alpha = 0) +
+  scale_fill_gradient(low = "#f7fbff", high = "#2171b5") +
+  labs(title = "Overlap between diagnosis ANOVAs (M3 / M4 / M5)") +
+  theme(plot.title = element_text(face = "bold", hjust = 0.5))
+
+ggsave(file.path(plot_dir, "M6_ANOVA_venn.png"),
+       p_venn, width = 9, height = 6, dpi = 300)
+message("Venn diagram saved.")
+```
+
+# 12. Visualization
+
+```{r}
+genes_interes <- same_fc
+genes_plot    <- head(genes_interes, 40)
+
+message("Genes in Basal_and_LPS_same_FC category: ", length(genes_interes))
+
+# logCPM for visualisation (already computed in M5 chunk)
+# logcpm is genes x samples, TMM-normalised
+
+# --- Interaction plot (mean logCPM per diagnosis x treatment) ---
+plot_df <- as.data.frame(logcpm) %>%
+  rownames_to_column("gene") %>%
+  filter(gene %in% genes_plot) %>%
+  pivot_longer(-gene, names_to = "sample", values_to = "expression") %>%
+  left_join(coldata %>% rownames_to_column("sample"), by = "sample")
+
+plot_summary <- plot_df %>%
+  group_by(gene, diagnosis, treatment) %>%
+  summarise(mean_expr = mean(expression), .groups = "drop")
+
+p_interaction <- ggplot(plot_summary,
+                        aes(x = treatment, y = mean_expr,
+                            color = diagnosis, group = diagnosis)) +
+  geom_line(linewidth = 1.2) +
+  geom_point(size = 2.5) +
+  facet_wrap(~gene, scales = "free_y") +
+  theme_bw(base_size = 13) +
+  labs(title    = "Genes with diagnosis differences but equivalent LPS response",
+       subtitle = "Parallel lines indicate preserved LPS fold-change across diagnoses",
+       x = "Condition", y = "Expression (logCPM)")
+
+ggsave(file.path(plot_dir, "M7_interaction_plot.png"),
+       p_interaction, width = 10, height = 8, dpi = 300)
+message("Interaction plot saved.")
+
+# --- Heatmap (top 100 genes, scaled per gene) ---
+genes_top <- head(genes_interes, 100)
+mat       <- logcpm[rownames(logcpm) %in% genes_top, ]
+
+mat_scaled <- t(scale(t(mat)))
+# Clip to ±2 SD to prevent outliers compressing the colour scale
+mat_scaled[mat_scaled >  2] <-  2
+mat_scaled[mat_scaled < -2] <- -2
+
+# Sort columns by diagnosis then treatment for visual interpretability
+col_anno    <- coldata[order(coldata$diagnosis, coldata$treatment),
+                       c("diagnosis", "treatment")]
+col_anno    <- as.data.frame(col_anno)
+mat_ordered <- mat_scaled[, rownames(col_anno)]
+
+png(file.path(plot_dir, "M7_heatmap.png"),
+    width = 1200, height = 1000, res = 150)
+pheatmap(mat_ordered,
+         annotation_col  = col_anno,
+         cluster_cols    = FALSE,       # preserve diagnosis/treatment ordering
+         show_rownames   = FALSE,
+         show_colnames   = FALSE,
+         fontsize_col    = 8,
+         color           = colorRampPalette(c("navy", "white", "firebrick3"))(100),
+         main            = "Heatmap — Basal_and_LPS_same_FC genes (z-scored logCPM)")
+dev.off()
+message("Heatmap saved.")
+
+# --- Per-diagnosis LFC distribution (from M5 lfc_summary) ---
+lfc_long <- lfc_summary %>%
+  filter(gene %in% genes_plot) %>%
+  pivot_longer(cols      = c(TEA_meanLFC, TOC_meanLFC, Tourette_meanLFC),
+               names_to  = "diagnosis",
+               values_to = "LFC") %>%
+  mutate(diagnosis = gsub("_meanLFC", "", diagnosis))
+
+p_lfc <- ggplot(lfc_long, aes(x = diagnosis, y = LFC, fill = diagnosis)) +
+  geom_boxplot(alpha = 0.7, outlier.shape = NA) +
+  geom_jitter(width = 0.2, size = 1, alpha = 0.6) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey40") +
+  facet_wrap(~gene, scales = "free_y") +
+  theme_bw(base_size = 13) +
+  labs(title    = "LPS log2 fold-change per diagnosis",
+       subtitle = "Genes with conserved response magnitude (Basal_and_LPS_same_FC)",
+       y = "log2 Fold Change (LPS vs Basal)", x = "")
+
+ggsave(file.path(plot_dir, "M7_LFC_by_diagnosis.png"),
+       p_lfc, width = 10, height = 8, dpi = 300)
+message("LFC distribution plot saved.")
+```
+
+

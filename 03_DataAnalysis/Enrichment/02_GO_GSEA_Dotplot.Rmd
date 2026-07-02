@@ -1,0 +1,867 @@
+---
+title: "07_GO_GSEA_Dotplot"
+output: html_document
+date: "2026-03-25"
+---
+
+## 0. Libraries and paths
+
+```{r setup, message=FALSE, warning=FALSE}
+
+# Install if needed:
+# BiocManager::install(c("fgsea", "org.Hs.eg.db", "GO.db", "AnnotationDbi"))
+# install.packages("ggplot2", "dplyr", "tidyr", "stringr", "tibble")
+
+library(fgsea)
+library(org.Hs.eg.db)
+library(GO.db)
+library(AnnotationDbi)
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(tibble)
+
+# ── Paths ─────────────────────────────────────────────────────────────────────
+deg_dir  <- "/home/jose/Desktop/RNAseq/results/counts/bulk/DEG/DESeq2"
+out_dir  <- "/home/jose/Desktop/RNAseq/results/Enrichment/GSEA_inputs/Reports/GO_GSEA/M3"
+plot_dir <- "/home/jose/Desktop/RNAseq/results/plots/Enrichment/Categorization/M3/M3.GO"
+
+dir.create(out_dir,  recursive = TRUE, showWarnings = FALSE)
+dir.create(plot_dir, recursive = TRUE, showWarnings = FALSE)
+
+# ── Parameters ────────────────────────────────────────────────────────────────
+FDR_CUTOFF  <- 0.05     # Primary threshold — increase to 0.25 if too few terms
+N_TOP       <- 50       # Top N terms per ontology per diagnosis to consider
+MIN_SIZE    <- 15       # Minimum gene set size
+MAX_SIZE    <- 500      # Maximum gene set size
+N_PERM      <- 10000    # Permutations — increase for more precise p-values
+SEED        <- 42
+
+diagnoses   <- c("ASD_vs_OCD", "ASD_vs_TD", "OCD_vs_TD")
+ontologies  <- c("BP", "MF", "CC")
+
+# Explicitly resolve namespace conflicts
+select <- dplyr::select
+filter <- dplyr::filter
+rename <- dplyr::rename
+```
+
+---
+
+## 1. Load DESeq2 results and build ranked lists
+
+```{r load_ranks}
+
+load_res <- function(filename) {
+  path <- file.path(deg_dir, filename)
+  if (!file.exists(path)) { message("Not found: ", filename); return(NULL) }
+  read.csv(path, stringsAsFactors = FALSE)
+}
+
+res_list <- list(
+  ASD_vs_OCD      = load_res("M3.1_Basal_ASD_vs_OCD_results.csv"),
+  ASD_vs_TD      = load_res("M3.2_Basal_ASD_vs_TS_results.csv"),
+  OCD_vs_TD = load_res("M3.3_Basal_OCD_vs_TS_results.csv")
+)
+
+# Build ranked list: stat preferred, log2FoldChange as fallback
+# Gene names must be ENTREZ IDs for fgsea with GO gene sets
+build_rank <- function(res_df, label) {
+  if (is.null(res_df)) return(NULL)
+
+  rank_col <- if ("stat" %in% colnames(res_df) &&
+                  !all(is.na(res_df$stat))) "stat" else "log2FoldChange"
+  message(label, ": ranking by '", rank_col, "'")
+
+  # Convert SYMBOL → ENTREZ
+  symbols <- res_df$gene[!is.na(res_df[[rank_col]]) & !is.na(res_df$gene)]
+  vals    <- res_df[[rank_col]][!is.na(res_df[[rank_col]]) & !is.na(res_df$gene)]
+
+  mapped <- AnnotationDbi::select(
+    org.Hs.eg.db,
+    keys    = symbols,
+    columns = "ENTREZID",
+    keytype = "SYMBOL"
+  ) %>%
+    filter(!is.na(ENTREZID)) %>%
+    distinct(SYMBOL, .keep_all = TRUE)
+
+  rank_df <- data.frame(SYMBOL = symbols, value = vals) %>%
+    inner_join(mapped, by = "SYMBOL") %>%
+    distinct(ENTREZID, .keep_all = TRUE) %>%
+    arrange(desc(value))
+
+  ranked <- setNames(rank_df$value, rank_df$ENTREZID)
+  message("  ", length(ranked), " genes mapped to ENTREZ")
+  ranked
+}
+
+ranked_lists <- lapply(names(res_list), function(d) {
+  build_rank(res_list[[d]], d)
+})
+names(ranked_lists) <- diagnoses
+
+```
+
+---
+
+## 2. Build GO gene sets from org.Hs.eg.db
+
+```{r go_genesets}
+
+message("Building GO gene sets from org.Hs.eg.db...")
+
+# Get GO → ENTREZ mapping for all three ontologies
+build_go_sets <- function(ontology) {
+  message("  Building ", ontology, " gene sets...")
+
+  # Get all GO terms for the ontology
+  go2gene <- AnnotationDbi::select(
+    org.Hs.eg.db,
+    keys    = keys(org.Hs.eg.db, keytype = "ENTREZID"),
+    columns = c("GO", "ONTOLOGY"),
+    keytype = "ENTREZID"
+  ) %>%
+    filter(ONTOLOGY == ontology, !is.na(GO)) %>%
+    select(GO, ENTREZID) %>%
+    distinct()
+
+  # Add GO term descriptions
+  go_terms <- AnnotationDbi::select(
+    GO.db,
+    keys    = unique(go2gene$GO),
+    columns = "TERM",
+    keytype = "GOID"
+  ) %>%
+    rename(GO = GOID)
+
+  go2gene <- go2gene %>%
+    left_join(go_terms, by = "GO") %>%
+    filter(!is.na(TERM))
+
+  # Convert to named list format required by fgsea
+  go_list <- split(go2gene$ENTREZID, go2gene$GO)
+
+  # Filter by size
+  sizes    <- lengths(go_list)
+  go_list  <- go_list[sizes >= MIN_SIZE & sizes <= MAX_SIZE]
+
+  # Keep term name mapping
+  term_map <- go2gene %>%
+    select(GO, TERM) %>%
+    distinct()
+
+  list(gene_sets = go_list, term_map = term_map)
+}
+
+go_data <- lapply(ontologies, build_go_sets)
+names(go_data) <- ontologies
+
+message("Gene set sizes:")
+for (ont in ontologies)
+  message("  ", ont, ": ", length(go_data[[ont]]$gene_sets), " terms")
+
+```
+
+---
+
+## 3. Run fgsea for each ontology and diagnosis
+
+```{r run_fgsea}
+
+set.seed(SEED)
+
+run_fgsea_one <- function(ranked, gene_sets, label, ontology) {
+  if (is.null(ranked) || length(ranked) == 0) return(NULL)
+
+  message("Running fgsea: ", label, " — ", ontology)
+
+  res <- fgsea(
+    pathways  = gene_sets,
+    stats     = ranked,
+    minSize   = MIN_SIZE,
+    maxSize   = MAX_SIZE,
+    nPerm     = N_PERM
+  )
+
+  res %>%
+    as_tibble() %>%
+    rename(GO = pathway, FDR = padj) %>%
+    mutate(
+      diagnosis = label,
+      ontology  = ontology,
+      direction = case_when(
+        FDR <= FDR_CUTOFF & NES > 0 ~ "up",
+        FDR <= FDR_CUTOFF & NES < 0 ~ "down",
+        TRUE                        ~ "ns"
+      )
+    ) %>%
+    left_join(go_data[[ontology]]$term_map, by = "GO") %>%
+    arrange(FDR)
+}
+
+# Run all combinations
+fgsea_results <- list()
+
+for (ont in ontologies) {
+  for (diag in diagnoses) {
+    key <- paste0(diag, "_", ont)
+    fgsea_results[[key]] <- run_fgsea_one(
+      ranked_lists[[diag]],
+      go_data[[ont]]$gene_sets,
+      diag, ont
+    )
+  }
+}
+
+# Combine into one master table
+fgsea_all <- bind_rows(fgsea_results) %>%
+  select(GO, TERM, ontology, diagnosis, NES, pval, FDR, direction,
+         size, leadingEdge)
+
+message("\nTotal results: ", nrow(fgsea_all))
+message("Significant (FDR < ", FDR_CUTOFF, "):")
+print(table(fgsea_all$ontology[fgsea_all$FDR < FDR_CUTOFF],
+            fgsea_all$diagnosis[fgsea_all$FDR < FDR_CUTOFF]))
+
+# Save full results
+write.csv(
+  fgsea_all %>% select(-leadingEdge),
+  file.path(out_dir, "GO_fgsea_all_results.csv"),
+  row.names = FALSE
+)
+message("Full results saved.")
+
+```
+
+---
+
+## 4. Select top terms for dotplot
+
+```{r select_terms}
+
+# For each ontology, select top N terms that are significant in
+# at least one diagnosis, ranked by max |NES| across diagnoses
+select_top_terms <- function(ont, n_top = N_TOP, fdr_cutoff = FDR_CUTOFF) {
+
+  df <- fgsea_all %>%
+    filter(ontology == ont)
+
+  # Terms significant in at least one diagnosis
+  sig_terms <- df %>%
+    filter(FDR <= fdr_cutoff) %>%
+    pull(GO) %>%
+    unique()
+
+  if (length(sig_terms) == 0) {
+    message("No significant terms for ", ont, " at FDR < ", fdr_cutoff,
+            " — relaxing to 0.25")
+    sig_terms <- df %>%
+      filter(FDR <= 0.25) %>%
+      pull(GO) %>%
+      unique()
+  }
+
+  # Rank by max |NES| across diagnoses
+  top_terms <- df %>%
+    filter(GO %in% sig_terms) %>%
+    group_by(GO, TERM) %>%
+    summarise(max_abs_NES = max(abs(NES), na.rm = TRUE),
+              n_sig       = sum(FDR <= fdr_cutoff, na.rm = TRUE),
+              .groups = "drop") %>%
+    arrange(desc(n_sig), desc(max_abs_NES)) %>%
+    slice_head(n = n_top) %>%
+    pull(GO)
+
+  message(ont, ": ", length(top_terms), " terms selected for dotplot")
+  top_terms
+}
+
+top_terms <- lapply(ontologies, select_top_terms)
+names(top_terms) <- ontologies
+
+```
+
+---
+
+## 5. Dotplot function
+
+```{r dotplot_function}
+
+make_go_dotplot <- function(ont, top_go_ids,
+                             title_suffix = "",
+                             max_label_length = 55) {
+
+  df_plot <- fgsea_all %>%
+    filter(ontology == ont, GO %in% top_go_ids) %>%
+    mutate(
+      # Truncate long term names
+      term_label  = str_trunc(TERM, max_label_length),
+      log10FDR    = -log10(FDR + 1e-10),
+      # Mark significance
+      sig_alpha   = case_when(
+        FDR <= FDR_CUTOFF ~ 1.0,
+        FDR <= 0.25       ~ 0.5,
+        TRUE              ~ 0.2
+      ),
+      diagnosis   = factor(diagnosis, levels = diagnoses)
+    )
+
+  # Order terms: first by direction in TEA, then by NES
+  term_order <- df_plot %>%
+    filter(diagnosis == "ASD_vs_OCD") %>%
+    arrange(NES) %>%
+    pull(term_label) %>%
+    unique()
+
+  # Add any terms not in TEA
+  all_terms <- unique(df_plot$term_label)
+  term_order <- c(term_order, setdiff(all_terms, term_order))
+
+  df_plot$term_label <- factor(df_plot$term_label, levels = term_order)
+
+  # Color scale limits — symmetric around 0
+  nes_limit <- max(abs(df_plot$NES), na.rm = TRUE)
+  nes_limit <- ceiling(nes_limit * 10) / 10
+
+  p <- ggplot(df_plot,
+              aes(x     = diagnosis,
+                  y     = term_label,
+                  color = NES,
+                  size  = log10FDR,
+                  alpha = sig_alpha)) +
+    geom_point() +
+    scale_color_gradient2(
+      low      = "#47ACFF",
+      mid      = "#FFE8D1",
+      high     = "#7b3294",
+      midpoint = 0,
+      limits   = c(-nes_limit, nes_limit),
+      name     = "NES"
+    ) +
+    scale_size_continuous(
+      range = c(1.5, 7),
+      name  = "-log10(FDR)"
+    ) +
+    scale_alpha_identity() +
+    scale_x_discrete(position = "top") +
+    labs(
+      title    = paste0("GO ", ont, " — GSEA results per diagnosis",
+                        title_suffix),
+      subtitle = paste0("Top ", length(top_go_ids),
+                        " terms significant in ≥1 diagnosis  |  ",
+                        "FDR < ", FDR_CUTOFF,
+                        "  |  Faded = borderline (FDR < 0.25)"),
+      x = NULL, y = NULL
+    ) +
+    theme_bw(base_size = 11) +
+    theme(
+      plot.title       = element_text(face = "bold", size = 12),
+      plot.subtitle    = element_text(size = 9, color = "grey40"),
+      axis.text.x      = element_text(face = "bold", size = 11,
+                                       angle = 0, hjust = 0.5),
+      axis.text.y      = element_text(size = 8),
+      panel.grid.major = element_line(color = "grey92"),
+      legend.position  = "right",
+      legend.box       = "vertical"
+    )
+
+  p
+}
+
+```
+
+---
+
+## 6. Generate and save dotplots
+
+```{r save_dotplots}
+
+for (ont in ontologies) {
+
+  if (length(top_terms[[ont]]) == 0) {
+    message("Skipping ", ont, " — no terms to plot")
+    next
+  }
+
+  p <- make_go_dotplot(ont, top_terms[[ont]])
+
+  # Dynamic height based on number of terms
+  n_terms  <- length(top_terms[[ont]])
+  fig_h    <- max(6, n_terms * 0.28 + 2.5)
+  fig_w    <- 9
+
+  filename <- paste0("GO_", ont, "_dotplot_top", n_terms, ".png")
+  ggsave(file.path(plot_dir, filename),
+         p, width = fig_w, height = fig_h, dpi = 300)
+  message("Saved: ", filename)
+}
+
+```
+
+---
+
+## 7. Combined figure — all 3 ontologies stacked
+
+```{r combined_figure}
+
+# Combine all ontologies in one tall figure with facets
+df_combined <- fgsea_all %>%
+  filter(
+    (ontology == "BP" & GO %in% top_terms$BP) |
+    (ontology == "MF" & GO %in% top_terms$MF) |
+    (ontology == "CC" & GO %in% top_terms$CC)
+  ) %>%
+  mutate(
+    term_label = str_trunc(TERM, 55),
+    log10FDR   = -log10(FDR + 1e-10),
+    sig_alpha  = case_when(
+      FDR <= FDR_CUTOFF ~ 1.0,
+      FDR <= 0.25       ~ 0.5,
+      TRUE              ~ 0.2
+    ),
+    diagnosis  = factor(diagnosis, levels = diagnoses),
+    ontology   = factor(ontology,  levels = ontologies)
+  )
+
+# Order terms within each ontology by NES in TEA
+term_order_combined <- df_combined %>%
+  filter(diagnosis == "ASD_vs_OCD") %>%
+  arrange(ontology, NES) %>%
+  pull(term_label) %>%
+  unique()
+
+all_terms_combined  <- unique(df_combined$term_label)
+term_order_combined <- c(term_order_combined,
+                          setdiff(all_terms_combined, term_order_combined))
+df_combined$term_label <- factor(df_combined$term_label,
+                                  levels = term_order_combined)
+
+nes_lim <- ceiling(max(abs(df_combined$NES), na.rm = TRUE) * 10) / 10
+
+p_combined <- ggplot(df_combined,
+                     aes(x     = diagnosis,
+                         y     = term_label,
+                         color = NES,
+                         size  = log10FDR,
+                         alpha = sig_alpha)) +
+  geom_point() +
+  scale_color_gradient2(
+    low = "#47ACFF", mid = "#FFE8D1", high = "#7b3294",
+    midpoint = 0, limits = c(-nes_lim, nes_lim),
+    name = "NES"
+  ) +
+  scale_size_continuous(range = c(1.5, 6), name = "-log10(FDR)") +
+  scale_alpha_identity() +
+  scale_x_discrete(position = "top") +
+  facet_grid(ontology ~ ., scales = "free_y", space = "free") +
+  labs(
+    title    = "Gene Ontology GSEA — all ontologies per diagnosis",
+    subtitle = paste0("FDR < ", FDR_CUTOFF,
+                      "  |  Faded = borderline  |  ",
+                      "Color = NES  |  Size = -log10(FDR)"),
+    x = NULL, y = NULL
+  ) +
+  theme_bw(base_size = 10) +
+  theme(
+    plot.title       = element_text(face = "bold", size = 12),
+    plot.subtitle    = element_text(size = 9, color = "grey40"),
+    axis.text.x      = element_text(face = "bold", size = 11,
+                                     angle = 0, hjust = 0.5),
+    axis.text.y      = element_text(size = 7),
+    strip.text.y     = element_text(face = "bold", angle = 0, size = 10),
+    strip.background = element_rect(fill = "grey95"),
+    panel.grid.major = element_line(color = "grey92"),
+    legend.position  = "right"
+  )
+
+n_total  <- length(unique(df_combined$term_label))
+ggsave(file.path(plot_dir, "GO_ALL_ontologies_combined_dotplot.png"),
+       p_combined,
+       width  = 10,
+       height = max(10, n_total * 0.22 + 4),
+       dpi    = 300)
+message("Combined dotplot saved.")
+
+```
+
+
+---
+
+## 7b. Dotplots by significance pattern
+
+```{r pattern_dotplots}
+
+# ── Classify each GO term by significance pattern across diagnoses ────────────
+term_patterns <- fgsea_all %>%
+  dplyr::filter(!is.na(FDR)) %>%
+  dplyr::group_by(GO, TERM, ontology) %>%
+  dplyr::summarise(
+    n_sig       = sum(FDR <= FDR_CUTOFF, na.rm = TRUE),
+    n_up        = sum(FDR <= FDR_CUTOFF & NES > 0, na.rm = TRUE),
+    n_down      = sum(FDR <= FDR_CUTOFF & NES < 0, na.rm = TRUE),
+    directions  = paste(sort(unique(direction[FDR <= FDR_CUTOFF])),
+                        collapse = "+"),
+    .groups = "drop"
+  ) %>%
+  dplyr::mutate(
+    pattern = dplyr::case_when(
+      n_sig == 3 & n_up == 3                        ~ "Shared_all_up",
+      n_sig == 3 & n_down == 3                      ~ "Shared_all_down",
+      n_sig == 3 & n_up > 0 & n_down > 0            ~ "Shared_all_divergent",
+      n_sig == 2 & n_up == 2                        ~ "Shared_2_up",
+      n_sig == 2 & n_down == 2                      ~ "Shared_2_down",
+      n_sig == 2 & n_up > 0 & n_down > 0            ~ "Shared_2_divergent",
+      n_sig == 1                                    ~ "Unique_1",
+      TRUE                                          ~ "Not_significant"
+    )
+  )
+
+message("Pattern distribution:")
+print(table(term_patterns$pattern, term_patterns$ontology))
+
+# Save pattern table
+write.csv(
+  term_patterns,
+  file.path(out_dir, "GO_term_patterns.csv"),
+  row.names = FALSE
+)
+
+# ── Dotplot per pattern ───────────────────────────────────────────────────────
+make_pattern_dotplot <- function(pattern_label, ont, max_terms = 40,
+                                  fdr_cutoff = FDR_CUTOFF) {
+
+  # Get GO IDs for this pattern + ontology
+  pattern_ids <- term_patterns %>%
+    dplyr::filter(pattern == pattern_label, ontology == ont) %>%
+    dplyr::arrange(desc(n_sig), dplyr::desc(
+      fgsea_all %>%
+        dplyr::filter(GO %in% GO, ontology == ont) %>%
+        dplyr::group_by(GO) %>%
+        dplyr::summarise(m = max(abs(NES)), .groups="drop") %>%
+        dplyr::pull(m) %>%
+        mean()
+    )) %>%
+    dplyr::pull(GO)
+
+  # Rank by max |NES| across diagnoses
+  pattern_ids <- fgsea_all %>%
+    dplyr::filter(GO %in% pattern_ids, ontology == ont) %>%
+    dplyr::group_by(GO) %>%
+    dplyr::summarise(max_abs_NES = max(abs(NES), na.rm = TRUE),
+                     .groups = "drop") %>%
+    dplyr::arrange(desc(max_abs_NES)) %>%
+    dplyr::slice_head(n = max_terms) %>%
+    dplyr::pull(GO)
+
+  if (length(pattern_ids) == 0) {
+    message("  No terms for pattern: ", pattern_label, " — ", ont)
+    return(invisible(NULL))
+  }
+
+  df_plot <- fgsea_all %>%
+    dplyr::filter(GO %in% pattern_ids, ontology == ont) %>%
+    dplyr::mutate(
+      term_label = stringr::str_trunc(TERM, 55),
+      log10FDR   = -log10(FDR + 1e-10),
+      sig_alpha  = dplyr::case_when(
+        FDR <= fdr_cutoff ~ 1.0,
+        FDR <= 0.25       ~ 0.5,
+        TRUE              ~ 0.15
+      ),
+      diagnosis  = factor(diagnosis, levels = diagnoses)
+    )
+
+  # Order terms by NES in TEA, then TOC
+  term_order <- df_plot %>%
+    dplyr::filter(diagnosis == "ASD_vs_OCD") %>%
+    dplyr::arrange(NES) %>%
+    dplyr::pull(term_label) %>%
+    unique()
+  remaining  <- setdiff(unique(df_plot$term_label), term_order)
+  term_order <- c(term_order, remaining)
+  df_plot$term_label <- factor(df_plot$term_label, levels = term_order)
+
+  nes_lim <- ceiling(max(abs(df_plot$NES), na.rm = TRUE) * 10) / 10
+
+  # Pattern-specific subtitle
+  subtitle_map <- c(
+    Shared_all_up       = "Significant & upregulated in all 3 diagnoses",
+    Shared_all_down     = "Significant & downregulated in all 3 diagnoses",
+    Shared_all_divergent = "Significant in all 3 — but opposite directions",
+    Shared_2_up         = "Significant & upregulated in exactly 2 diagnoses",
+    Shared_2_down       = "Significant & downregulated in exactly 2 diagnoses",
+    Shared_2_divergent  = "Significant in 2 diagnoses — opposite directions",
+    Unique_1            = "Significant in exactly 1 diagnosis only"
+  )
+
+  p <- ggplot(df_plot,
+              aes(x     = diagnosis,
+                  y     = term_label,
+                  color = NES,
+                  size  = log10FDR,
+                  alpha = sig_alpha)) +
+    geom_point() +
+    scale_color_gradient2(
+      low      = "#47ACFF",
+      mid      = "#FFE8D1",
+      high     = "#7b3294",
+      midpoint = 0,
+      limits   = c(-nes_lim, nes_lim),
+      name     = "NES"
+    ) +
+    scale_size_continuous(range = c(2, 7), name = "-log10(FDR)") +
+    scale_alpha_identity() +
+    scale_x_discrete(position = "top") +
+    labs(
+      title    = paste0("GO ", ont, " — ", subtitle_map[pattern_label]),
+      subtitle = paste0("Top ", length(pattern_ids), " terms  |  ",
+                        "FDR < ", fdr_cutoff,
+                        "  |  Faded points = borderline (FDR < 0.25)"),
+      x = NULL, y = NULL
+    ) +
+    theme_bw(base_size = 11) +
+    theme(
+      plot.title       = element_text(face = "bold", size = 11),
+      plot.subtitle    = element_text(size = 9, color = "grey40"),
+      axis.text.x      = element_text(face = "bold", size = 11,
+                                       angle = 0, hjust = 0.5),
+      axis.text.y      = element_text(size = 8),
+      panel.grid.major = element_line(color = "grey92"),
+      legend.position  = "right"
+    )
+
+  p
+}
+
+# ── Generate one dotplot per pattern per ontology ────────────────────────────
+patterns_to_plot <- c(
+  "Shared_all_up", "Shared_all_down", "Shared_all_divergent",
+  "Shared_2_up",   "Shared_2_down",   "Shared_2_divergent",
+  "Unique_1"
+)
+
+for (ont in ontologies) {
+  for (pat in patterns_to_plot) {
+
+    n_terms <- term_patterns %>%
+      dplyr::filter(pattern == pat, ontology == ont) %>%
+      nrow()
+
+    if (n_terms == 0) next
+
+    p <- make_pattern_dotplot(pat, ont, max_terms = 40)
+    if (is.null(p)) next
+
+    filename <- paste0("GO_", ont, "_", pat, "_dotplot.png")
+    n_plot   <- length(unique(p$data$term_label))
+    fig_h    <- max(4, n_plot * 0.28 + 2.5)
+
+    ggsave(file.path(plot_dir, filename),
+           p, width = 9, height = fig_h, dpi = 300)
+    message("Saved: ", filename)
+  }
+}
+
+# ── Summary panel: one row per pattern showing term counts ───────────────────
+pattern_counts <- term_patterns %>%
+  dplyr::filter(pattern != "Not_significant") %>%
+  dplyr::count(ontology, pattern) %>%
+  dplyr::mutate(
+    pattern = factor(pattern, levels = rev(patterns_to_plot)),
+    ontology = factor(ontology, levels = ontologies)
+  )
+
+p_summary <- ggplot(pattern_counts,
+                    aes(x = n, y = pattern, fill = ontology)) +
+  geom_col(position = "dodge", alpha = 0.85) +
+  geom_text(aes(label = n),
+            position = position_dodge(width = 0.9),
+            hjust = -0.1, size = 3.5) +
+  scale_fill_manual(values = c("BP" = "#e05c5c",
+                                "MF" = "#4e9af1",
+                                "CC" = "#2ecc71")) +
+  scale_x_continuous(expand = expansion(mult = c(0, 0.15))) +
+  labs(
+    title    = "GO GSEA — Number of terms per significance pattern",
+    subtitle = paste0("FDR < ", FDR_CUTOFF),
+    x = "Number of GO terms", y = NULL, fill = "Ontology"
+  ) +
+  theme_bw(base_size = 11) +
+  theme(
+    plot.title = element_text(face = "bold"),
+    legend.position = "right"
+  )
+
+ggsave(file.path(plot_dir, "GO_pattern_summary_barplot.png"),
+       p_summary, width = 10, height = 6, dpi = 300)
+message("Pattern summary barplot saved.")
+
+```
+
+
+
+
+---
+
+## 8. Summary
+
+```{r summary}
+
+message("\n=== SUMMARY ===")
+message("Significant terms (FDR < ", FDR_CUTOFF, "):")
+sig_summary <- fgsea_all %>%
+  filter(FDR < FDR_CUTOFF) %>%
+  group_by(ontology, diagnosis, direction) %>%
+  summarise(n = n(), .groups = "drop") %>%
+  pivot_wider(names_from = c(diagnosis, direction),
+              values_from = n, values_fill = 0)
+print(sig_summary)
+
+message("\nOutput files:")
+message("  GO_fgsea_all_results.csv           — full results all terms")
+for (ont in ontologies)
+  message("  GO_", ont, "_dotplot_top*.png        — individual dotplot")
+message("  GO_ALL_ontologies_combined_dotplot.png — combined figure")
+
+message("\nNOTE: If too few terms at FDR < ", FDR_CUTOFF,
+        ", increase FDR_CUTOFF to 0.25 in setup chunk.")
+
+```
+
+## 8b. Emapplot — enrichment map per ontology and diagnosis
+
+```{r emapplot}
+
+# BiocManager::install(c("clusterProfiler", "enrichplot")) if needed
+library(clusterProfiler)
+library(enrichplot)
+
+# ── Convert fgsea results to gseaResult object (clusterProfiler format) ───────
+make_gsea_result <- function(fgsea_df, ont, diag, gene_sets) {
+
+  df <- fgsea_df %>%
+    dplyr::filter(ontology == ont, diagnosis == diag, !is.na(FDR)) %>%
+    dplyr::arrange(FDR)
+
+  if (nrow(df) == 0) return(NULL)
+
+  # Build the gseaResult object manually
+  gsea_obj <- new("gseaResult",
+    result     = as.data.frame(df %>%
+      dplyr::select(
+        ID          = GO,
+        Description = TERM,
+        setSize     = size,
+        enrichmentScore = NES,   # fgsea NES ≈ ES
+        NES,
+        pvalue      = pval,
+        p.adjust    = FDR,
+        qvalue      = FDR,
+        rank        = pval,      # placeholder
+        leading_edge = leadingEdge
+      ) %>%
+      dplyr::mutate(
+        core_enrichment = sapply(leading_edge,
+                                  function(x) paste(x, collapse = "/"))
+      ) %>%
+      dplyr::select(-leading_edge)
+    ),
+    readable   = FALSE,
+    geneSets   = gene_sets,
+    geneList   = ranked_lists[[diag]],
+    keytype    = "ENTREZID",
+    organism   = "Homo sapiens",
+    setType    = paste0("GO_", ont),
+    permScores = matrix(),
+    params     = list(pvalueCutoff  = FDR_CUTOFF,
+                      pAdjustMethod = "BH",
+                      minGSSize     = MIN_SIZE,
+                      maxGSSize     = MAX_SIZE)
+  )
+
+  gsea_obj
+}
+
+# ── Generate emapplot for significant terms ───────────────────────────────────
+make_emapplot <- function(gsea_obj, diag, ont, fdr_cutoff = FDR_CUTOFF,
+                           showCategory = 30) {
+
+  if (is.null(gsea_obj)) return(invisible(NULL))
+
+  # Filter to significant terms
+  sig_obj <- gsea_obj
+  sig_obj@result <- sig_obj@result %>%
+    dplyr::filter(p.adjust <= fdr_cutoff)
+
+  if (nrow(sig_obj@result) < 3) {
+    message("  Too few significant terms for emapplot: ",
+            diag, " — ", ont, " (n=", nrow(sig_obj@result), ")")
+    return(invisible(NULL))
+  }
+
+  # Calculate pairwise term similarity
+  sig_obj <- pairwise_termsim(sig_obj)
+
+  p <- emapplot(
+    sig_obj,
+    showCategory = min(showCategory, nrow(sig_obj@result)),
+    color        = "NES",
+    layout       = "nicely",
+  ) +
+    scale_color_gradient2(
+      low      = "#47ACFF",
+      mid      = "#FFE8D1",
+      high     = "#7b3294",
+      midpoint = 0,
+      name     = "NES"
+    ) +
+    labs(
+      title    = paste0("GO ", ont, " — Enrichment map: ", diag),
+      subtitle = paste0("FDR < ", fdr_cutoff,
+                        "  |  Nodes = GO terms  |  Edges = shared genes")
+    ) +
+    theme(
+      plot.title    = element_text(face = "bold", size = 11),
+      plot.subtitle = element_text(size = 9, color = "grey40")
+    )
+
+  p
+}
+
+# ── Run for all ontologies and diagnoses ──────────────────────────────────────
+MIN_TERMS_EMAP <- 10  # minimum terms needed for a meaningful emapplot
+
+for (ont in ontologies) {
+  for (diag in diagnoses) {
+
+    # Check how many significant terms exist before attempting
+    n_sig <- fgsea_all %>%
+      dplyr::filter(ontology == ont, diagnosis == diag,
+                    FDR < FDR_CUTOFF) %>%
+      nrow()
+
+    if (n_sig < MIN_TERMS_EMAP) {
+      message("Skipping emapplot: ", diag, " — ", ont,
+              "  (only ", n_sig, " significant terms, need >= ", MIN_TERMS_EMAP, ")")
+      next
+    }
+
+    message("Emapplot: ", diag, " — ", ont, "  (", n_sig, " terms)")
+
+    gsea_obj <- make_gsea_result(fgsea_all, ont, diag,
+                                  go_data[[ont]]$gene_sets)
+    p <- make_emapplot(gsea_obj, diag, ont)
+    if (is.null(p)) next
+
+    filename <- paste0("GO_", ont, "_", diag, "_emapplot.png")
+    ggsave(file.path(plot_dir, filename), p,
+           width = 10, height = 9, dpi = 300)
+    message("  Saved: ", filename)
+  }
+}
+
+```
+
+

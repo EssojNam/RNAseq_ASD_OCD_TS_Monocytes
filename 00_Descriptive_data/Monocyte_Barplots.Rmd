@@ -1,0 +1,299 @@
+---
+title: "Monocyte_Barplots"
+output: html_document
+date: "2026-05-15"
+---
+
+## 0. Libraries and paths
+
+```{r setup, message=FALSE, warning=FALSE}
+
+# install.packages(c("ggpubr", "rstatix", "patchwork"))
+library(haven)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(ggpubr)
+library(rstatix)
+library(patchwork)
+library(ggbreak)
+
+spss_path <- "/home/jose/Desktop/RNAseq/data/Diagnosis_data/bbddtfg_NataliaCongreso.sav"
+out_dir   <- "/home/jose/Desktop/RNAseq/results/Descriptive/Monocytes"
+dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+
+```
+
+---
+
+## 1. Load and prepare data
+
+```{r prepare}
+
+df_raw <- read_sav(spss_path)
+
+df <- df_raw %>%
+  mutate(
+    Diagnosis = factor(as.numeric(GRUPO),
+                       levels = c(0, 1, 2),
+                       labels = c("OCD", "Tourette", "ASD"))
+  ) %>%
+  mutate(
+    # Average technical duplicates
+    Monocytes_pct    = rowMeans(cbind(as.numeric(Monocytes1),
+                                       as.numeric(Monocytes2)),
+                                 na.rm = TRUE),
+    CD16pos_pct      = rowMeans(cbind(as.numeric(CD16pos1),
+                                       as.numeric(CD16pos2)),
+                                 na.rm = TRUE),
+    Classical_pct    = rowMeans(cbind(as.numeric(Classical1),
+                                       as.numeric(Classical2)),
+                                 na.rm = TRUE),
+    Intermediate_pct = rowMeans(cbind(as.numeric(Intermediate1),
+                                       as.numeric(Intermediate2)),
+                                 na.rm = TRUE),
+    Nonclassical_pct = rowMeans(cbind(as.numeric(Nonclassical1),
+                                       as.numeric(Nonclassical2)),
+                                 na.rm = TRUE)
+  )
+
+# Check value ranges — helps identify if Totalmonocytes is the issue
+message("Value ranges after averaging duplicates:")
+vars_check <- c("Monocytes_pct", "CD16pos_pct",
+                "Classical_pct", "Intermediate_pct", "Nonclassical_pct")
+for (v in vars_check) {
+  vals <- df[[v]]
+  message(sprintf("  %-22s  min=%5.1f  median=%5.1f  max=%5.1f  NA=%d",
+                  v,
+                  min(vals,    na.rm = TRUE),
+                  median(vals, na.rm = TRUE),
+                  max(vals,    na.rm = TRUE),
+                  sum(is.na(vals))))
+}
+
+```
+
+---
+
+## 2. Reshape to long format
+
+```{r reshape}
+
+df_long <- df %>%
+  dplyr::select(CODIGO, Diagnosis, all_of(vars_check)) %>%
+  pivot_longer(
+    cols      = -c(CODIGO, Diagnosis),
+    names_to  = "Variable",
+    values_to = "Value"
+  ) %>%
+  mutate(
+    Variable = factor(Variable,
+      levels = vars_check,
+      labels = c(
+        "Total monocytes\n(% leukocytes)",
+        "CD16+ monocytes\n(%)",
+        "Classical\n(%)",
+        "Intermediate\n(%)",
+        "Non-classical\n(%)"
+      )
+    )
+  ) %>%
+  filter(!is.na(Value))
+
+```
+
+---
+
+## 3. Statistical tests
+
+```{r stats}
+
+# Kruskal-Wallis per variable
+kw_results <- df_long %>%
+  group_by(Variable) %>%
+  kruskal_test(Value ~ Diagnosis) %>%
+  adjust_pvalue(method = "BH") %>%
+  add_significance()
+
+message("Kruskal-Wallis results:")
+print(kw_results %>%
+        dplyr::select(Variable, statistic, df, p, p.adj, p.adj.signif))
+
+# Dunn post-hoc pairwise
+dunn_results <- df_long %>%
+  group_by(Variable) %>%
+  dunn_test(Value ~ Diagnosis, p.adjust.method = "BH") %>%
+  add_xy_position(x = "Diagnosis")
+
+```
+
+---
+
+## 4. Plot function
+
+```{r plot_function}
+
+diag_colors <- c(
+  "OCD"      = "#191970",
+  "Tourette" = "#f4a460",
+  "ASD"      = "#b03060"
+)
+
+make_barplot <- function(var_label) {
+
+  df_var <- df_long %>% filter(Variable == var_label)
+
+  # Detect outlier threshold — Q3 + 3*IQR
+  q75   <- quantile(df_var$Value, 0.75, na.rm = TRUE)
+  iqr   <- IQR(df_var$Value, na.rm = TRUE)
+  upper <- q75 + 3 * iqr
+  has_outliers <- any(df_var$Value > upper, na.rm = TRUE)
+
+  # If outliers present, define break points
+  # Lower range: 0 to just above the bulk of data (95th percentile)
+  # Upper range: just below the outlier to max
+  p95   <- quantile(df_var$Value, 0.95, na.rm = TRUE)
+  max_v <- max(df_var$Value, na.rm = TRUE)
+
+  df_sum <- df_var %>%
+    group_by(Diagnosis) %>%
+    summarise(
+      mean_val = mean(Value, na.rm = TRUE),
+      se_val   = sd(Value,   na.rm = TRUE) / sqrt(n()),
+      n        = n(),
+      .groups  = "drop"
+    )
+
+  kw_p     <- kw_results %>% filter(Variable == var_label) %>% pull(p)
+  kw_label <- paste0("KW p = ", signif(kw_p, 3))
+  dunn_var <- dunn_results %>% filter(Variable == var_label, p.adj < 0.05 )
+#, p.adj < 0.05
+  p <- ggplot(df_sum,
+              aes(x = Diagnosis, y = mean_val, fill = Diagnosis)) +
+    geom_bar(stat = "identity", width = 0.6, alpha = 0.85) +
+    geom_errorbar(aes(ymin = mean_val - se_val,
+                      ymax = mean_val + se_val),
+                  width = 0.2, linewidth = 0.7, color = "grey30") +
+    geom_jitter(data  = df_var,
+                aes(x = Diagnosis, y = Value),
+                shape = 21, size = 1.8, alpha = 0.55,
+                fill  = "white", color = "grey40",
+                width = 0.12) +
+    scale_fill_manual(values = diag_colors, guide = "none") +
+    scale_y_continuous(expand = expansion(mult = c(0, 0.15))) +
+    labs(
+      title    = as.character(var_label),
+      subtitle = kw_label,
+      x        = NULL,
+      y        = "Mean \u00B1 SE (%)"
+    ) +
+    theme_bw(base_size = 11) +
+    theme(
+      plot.title         = element_text(face = "bold", size = 10, hjust = 0.5),
+      plot.subtitle      = element_text(size = 8, color = "grey40", hjust = 0.5),
+      axis.text.x        = element_text(face = "bold", size = 9),
+      panel.grid.major.x = element_blank()
+    )
+
+  # Apply axis break only when outliers detected
+  if (has_outliers) {
+    break_lower <- p95 * 1.15   # top of lower range
+    break_upper <- max_v * 0.85 # bottom of upper range
+    p <- p +
+      scale_y_break(
+        breaks    = c(break_lower, break_upper),
+        scales    = 0.3,          # upper segment smaller
+        ticklabels = TRUE,
+        space     = 0.08
+      )
+  }
+
+  if (nrow(dunn_var) > 0) {
+    p <- p +
+      stat_pvalue_manual(
+        dunn_var,
+        label      = "p.adj.signif",      #.SIGNIF
+        tip.length = 0.01,
+        size       = 3.5,
+        hide.ns    = TRUE    #true
+      )
+  }
+
+  p
+}
+
+```
+
+---
+
+## 5. Generate and save plots
+
+```{r generate_plots}
+
+var_labels <- levels(df_long$Variable)
+
+plots <- setNames(
+  lapply(var_labels, make_barplot),
+  var_labels
+)
+
+# Individual plots
+for (v in var_labels) {
+  fname <- paste0(gsub("[^A-Za-z]", "_", v), ".png")
+  ggsave(file.path(out_dir, fname),
+         plots[[v]], width = 4, height = 5, dpi = 300)
+  message("Saved: ", fname)
+}
+
+# Combined panel
+p_panel <- wrap_plots(plots, ncol = 3) +
+  plot_annotation(
+    title    = "Monocyte populations by diagnosis",
+    subtitle = paste0("Mean ± SE  |  Individual values shown  |  ",
+                      "Kruskal-Wallis + Dunn post-hoc (BH correction)  |  ",
+                      "Brackets: p.adj < 0.05"),
+    theme = theme(
+      plot.title    = element_text(face = "bold", size = 13),
+      plot.subtitle = element_text(size = 9, color = "grey40")
+    )
+  )
+
+ggsave(
+  file.path(out_dir, "Monocyte_panel_all.png"),
+  p_panel,
+  width  = 14,
+  height = 10,
+  dpi    = 300
+)
+message("Panel figure saved.")
+
+```
+
+---
+
+## 6. Summary table
+
+```{r summary_table}
+
+summary_tbl <- df_long %>%
+  group_by(Variable, Diagnosis) %>%
+  summarise(
+    n      = n(),
+    Mean   = round(mean(Value), 2),
+    SD     = round(sd(Value),   2),
+    Median = round(median(Value), 2),
+    IQR    = round(IQR(Value),  2),
+    .groups = "drop"
+  )
+
+write.csv(summary_tbl,
+          file.path(out_dir, "Monocyte_summary_by_diagnosis.csv"),
+          row.names = FALSE)
+message("Summary table saved.")
+print(summary_tbl)
+
+# Also print KW results
+message("\nKruskal-Wallis + BH correction:")
+print(kw_results %>% dplyr::select(Variable, p, p.adj, p.adj.signif))
+
+```
